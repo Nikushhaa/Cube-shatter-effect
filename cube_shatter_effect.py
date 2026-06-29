@@ -1,68 +1,16 @@
 """
-cube_shatter_effect.py  –  Holographic Hand Shatter Effect  (v3 — Cinematic VFX)
+cube_shatter_effect.py  –  Holographic Hand Shatter Effect  (v3 — Cinematic VFX, cube removed)
 ═══════════════════════════════════════════════════════════════════════════════════
-Real-time AR holographic cube controlled by hand gestures.
+Real-time AR hand-triggered shatter effect.
 
-  - Closed fist  → real 3D holographic cube rotates, floats, glows above the hand
-  - Open hand    → cube disintegrates: cracks → energy pulse → thousands of
-                   glowing holographic crystal particles scatter in 3D space
-  - Close again  → particles orbit the hand, converge, cube rebuilds face-by-face
+  - Closed fist  → idle (nothing shown, ready)
+  - Open hand    → cracks appear → energy pulse → thousands of glowing
+                   crystal particles scatter in 3D space
+  - Close again  → particles orbit the hand, converge into the palm, fade out
 
-WHAT'S NEW IN v3 vs v2
-──────────────────────
-HOLOGRAM QUALITY
-  • True 3D depth perception: perspective-correct Z sorting, depth-based face
-    brightness, and a subtle fog/distance fade on far faces.
-  • Dynamic per-face lighting recalculated every frame with a time-varying light
-    direction, giving the hologram a "breathing" quality.
-  • Glowing edges rendered at variable thickness keyed to face brightness.
-  • Animated inner-face energy grid with criss-cross diagonal lines in addition
-    to scanlines — reads as a "data mesh" hologram pattern.
-  • Chromatic-aberration fringe on edges (1-2 px R/B offset), zero extra cost.
-  • Hologram flicker: a 2-component noise signal (fast flutter + slow drift)
-    modulates overall alpha so the cube never looks perfectly static.
-  • Inertia / spring follow: the cube position lags the palm with a configurable
-    spring constant and damping factor; velocity influences idle rotation tilt.
-
-3D PARTICLES
-  • Every particle now carries an explicit z coordinate.
-  • Perspective projection: near particles render larger, far particles smaller.
-  • Particles have 3D velocity (vx, vy, vz) and spin-yaw so depth changes
-    per frame, maintaining true volumetric spread.
-  • Gravity is applied only in Y; drag is isotropic in 3D.
-  • Turbulence: a per-particle sine-phase adds lateral drift that varies by z.
-  • During ORBIT, particles spiral on a full 3D ellipsoid, not a flat circle.
-  • Depth-sorted batch rendering: far particles drawn before near ones so alpha
-    compositing reads correctly.
-
-SHATTER SEQUENCE
-  • Pre-explosion "crack" phase: before particles fly, hairline cracks draw
-    across the cube faces (Voronoi-like line set, pre-generated per explosion).
-  • Energy pulse ring expands from the cube center just before detonation.
-  • Two-wave explosion: fast outer shell fractures first, dense inner core
-    follows 80 ms later with a second velocity burst.
-
-CINEMATIC EFFECTS
-  • Camera shake: the frame origin is offset by a damped random vector at the
-    moment of explosion, decaying over ~0.4 s.
-  • Bloom/glow pulse: the ROI bloom sigma spikes at the explosion moment and
-    decays, so the flash reads as a genuine energy release.
-  • Light spill: a soft radial glow is additively composited onto the area just
-    below the cube (simulates reflected hologram light on the hand/table).
-  • Floating ambient particles: small sparkles orbit the hand even in INTACT
-    state, giving an "energy field" aura to the hologram.
-
-PERFORMANCE
-  • All v2 optimisations are preserved (SoA pool, vectorised physics, ROI blur,
-    per-face ROI blend instead of full-frame copy).
-  • Crack lines are pre-generated at explosion time and cached; crack drawing is
-    a vectorised line-batch on a small overlay, never recomputed per-frame.
-  • 3D particle physics adds only 3 extra scalar vectorised ops (z velocity,
-    z position, perspective scale) — negligible vs. the 2D ops already in place.
-  • Depth sort uses np.argsort on the live slice once per frame: O(N log N) but
-    N ≤ 2200 so <1 ms on any modern CPU.
-  • Light-spill is a single small Gaussian-blurred circle composited as ADD —
-    no per-pixel math.
+NOTE: The holographic cube object has been fully removed. Only the crack /
+explosion / particle / shockwave / bloom / camera-shake cinematic effects
+remain, exactly as before.
 
 Requirements:
     pip install opencv-python mediapipe numpy
@@ -107,46 +55,8 @@ GESTURE_CONFIDENCE  = 0.85
 CONFIRM_FRAMES      = 6
 SMOOTHING           = 0.12
 
-# Cube – 3D geometry
+# Object size (drives explosion / crack / particle scale relative to hand size)
 CUBE_HALF        = 90
-CHARGE_SECS      = 0.9
-CUBE_SPIN_SPEED  = 0.45        # rad/s base Y spin
-CUBE_TILT_SPEED  = 0.28        # rad/s X wobble
-CUBE_TILT_AMOUNT = 0.18        # radians amplitude
-CUBE_FLOAT_AMP   = 7.0         # px
-CUBE_FLOAT_SPEED = 1.1         # rad/s
-CUBE_FOV         = 620.0       # perspective focal length
-
-# Cube – spring follow
-SPRING_K    = 14.0             # spring stiffness (higher = snappier)
-SPRING_DAMP = 0.72             # velocity damping (0–1; lower = more bounce)
-SPRING_MAX_V = 28.0            # max spring velocity (px/s)
-
-# Cube – lighting (light direction varies slowly over time)
-LIGHT_BASE_DIR   = np.array([0.35, -0.55, -0.75], dtype=np.float64)
-LIGHT_BASE_DIR  /= np.linalg.norm(LIGHT_BASE_DIR)
-LIGHT_SWING      = 0.30        # amplitude of light-direction oscillation
-LIGHT_SWING_FREQ = 0.25        # Hz
-LIGHT_AMBIENT    = 0.30
-FACE_ALPHA       = 0.38
-EDGE_GLOW_BOOST  = 1.2
-
-# Cube – hologram flicker
-FLICKER_FAST_FREQ = 14.0       # Hz — short flutter
-FLICKER_SLOW_FREQ =  2.7       # Hz — slow drift
-FLICKER_FAST_AMP  =  0.06      # 0–1 amplitude of fast component
-FLICKER_SLOW_AMP  =  0.10      # 0–1 amplitude of slow component
-
-# Cube – glitch
-GLITCH_INTERVAL    = 4.5       # avg seconds between glitches
-GLITCH_DURATION    = 0.09      # how long one glitch lasts
-
-# Cube – chromatic aberration on edges
-CHROMA_OFFSET = 2              # px offset for R/B fringe on edges
-
-# Cube – inertia-based tilt from hand velocity
-VEL_TILT_SCALE = 0.0012       # how much hand velocity tilts the cube (rad per px/s)
-VEL_TILT_DECAY = 0.88          # per-frame decay of velocity-tilt
 
 # Cinematic reassembly timings
 ORBIT_SECS       = 0.70
@@ -171,10 +81,6 @@ SHAKE_DECAY     = 5.5          # exponential decay rate (higher = faster settle)
 # Bloom pulse
 BLOOM_PEAK_SIGMA  = 28.0       # Gaussian sigma at explosion peak
 BLOOM_DECAY_SECS  =  0.5       # how long bloom pulse lasts
-
-# Light spill
-LIGHT_SPILL_RADIUS = 60        # px, radius of light-spill blob below cube
-LIGHT_SPILL_ALPHA  = 0.18      # max intensity of spill
 
 # Particles (3D)
 FRAG_DIVS          = 9
@@ -206,13 +112,11 @@ PERSP_FOCAL       = 460.0     # focal length for particle perspective
 SPARK_COUNT    = 100
 
 # Colors (BGR)
-CLR_CUBE_BASE   = (235, 228, 218)
 CLR_GLOW        = (200, 248, 255)
 CLR_CHARGE      = ( 80, 190, 255)
 CLR_SHOCKWAVE   = (100, 220, 255)
 CLR_SKELETON    = (  0, 175,  75)
 CLR_JOINT       = (  0, 120, 255)
-CLR_LIGHT_SPILL = (160, 230, 255)   # warm cyan spill
 
 PARTICLE_PALETTE = np.array([
     (255, 255, 255),
@@ -308,7 +212,7 @@ def draw_skeleton(frame, pts_px, skeleton_layer):
         cv2.circle(skeleton_layer, p, 3, CLR_JOINT, -1, cv2.LINE_AA)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# GESTURE RECOGNISER  (unchanged from v2)
+# GESTURE RECOGNISER  (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class GestureRecogniser:
@@ -344,7 +248,7 @@ class GestureRecogniser:
             elif raw == "closed" and self._close_cnt >= CONFIRM_FRAMES:
                 self.gesture = "closed"
 
-        # Estimate palm velocity for inertia tilt
+        # Estimate palm velocity (still used for HUD display)
         palm = np.array(palm_centre(pts), dtype=np.float32)
         if self._prev_palm is not None and dt > 0:
             self.palm_velocity = (palm - self._prev_palm) / max(dt, 0.001)
@@ -356,283 +260,7 @@ class GestureRecogniser:
         return self._smooth
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 3D HOLOGRAPHIC CUBE  (v3 upgrades: dynamic light, flicker, chroma, inertia)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-_CUBE_OBJ_VERTS = np.array([
-    [-1,-1,-1],[ 1,-1,-1],[ 1, 1,-1],[-1, 1,-1],
-    [-1,-1, 1],[ 1,-1, 1],[ 1, 1, 1],[-1, 1, 1],
-], dtype=np.float64)
-
-_CUBE_FACE_IDX = [
-    (0,1,2,3), (5,4,7,6), (4,0,3,7), (1,5,6,2), (4,5,1,0), (3,2,6,7),
-]
-_CUBE_FACE_NORMALS_OBJ = np.array([
-    [0,0,-1],[0,0,1],[-1,0,0],[1,0,0],[0,-1,0],[0,1,0],
-], dtype=np.float64)
-_CUBE_EDGES = [
-    (0,1),(1,2),(2,3),(3,0),(4,5),(5,6),(6,7),(7,4),(0,4),(1,5),(2,6),(3,7),
-]
-
-
-def rotation_matrix(rx, ry, rz):
-    cx, sx = math.cos(rx), math.sin(rx)
-    cy, sy = math.cos(ry), math.sin(ry)
-    cz, sz = math.cos(rz), math.sin(rz)
-    Rx = np.array([[1,0,0],[0,cx,-sx],[0,sx,cx]])
-    Ry = np.array([[cy,0,sy],[0,1,0],[-sy,0,cy]])
-    Rz = np.array([[cz,-sz,0],[sz,cz,0],[0,0,1]])
-    return Rz @ Ry @ Rx
-
-
-def dynamic_light_dir(t):
-    """Slowly oscillating light direction — gives hologram a breathing feel."""
-    swing = LIGHT_SWING * math.sin(2 * math.pi * LIGHT_SWING_FREQ * t)
-    d = LIGHT_BASE_DIR.copy()
-    d[0] += swing * 0.7
-    d[1] += swing * 0.4
-    n = np.linalg.norm(d)
-    return d / n if n > 1e-6 else LIGHT_BASE_DIR
-
-
-def flicker_alpha(t):
-    """Two-component hologram flicker noise (fast + slow) → [0.75 … 1.0]."""
-    fast = FLICKER_FAST_AMP * math.sin(2 * math.pi * FLICKER_FAST_FREQ * t)
-    slow = FLICKER_SLOW_AMP * math.sin(2 * math.pi * FLICKER_SLOW_FREQ * t)
-    return max(0.75, 1.0 - abs(fast + slow))
-
-
-class HoloCube:
-    """
-    True 3D holographic cube with:
-    • Spring-based position follow (separate from state machine)
-    • Dynamic per-frame lighting
-    • Hologram flicker + glitch
-    • Chromatic aberration on edges
-    • Animated energy-grid (scanlines + diagonal mesh)
-    • Inertia tilt from hand velocity
-    • Depth-faded far faces
-    """
-
-    def __init__(self):
-        self.ry        = 0.0
-        self.pos       = np.zeros(2, dtype=np.float32)   # spring position
-        self.vel       = np.zeros(2, dtype=np.float32)   # spring velocity
-        self._inited   = False
-        self._vel_tilt = np.zeros(2, dtype=np.float32)   # velocity-based extra tilt
-        self._glitch_t = -999.0                           # last glitch start time
-
-    def _spring_update(self, target, dt):
-        """Move self.pos toward target with spring + damping."""
-        if not self._inited:
-            self.pos[:] = target
-            self._inited = True
-            return
-        diff = np.array(target, dtype=np.float32) - self.pos
-        self.vel += diff * (SPRING_K * dt)
-        self.vel *= SPRING_DAMP
-        speed = np.linalg.norm(self.vel)
-        if speed > SPRING_MAX_V:
-            self.vel *= SPRING_MAX_V / speed
-        self.pos += self.vel * dt
-
-    def reset(self):
-        self._inited = False
-        self.vel[:] = 0
-        self._vel_tilt[:] = 0
-
-    def project(self, cx, cy, s, t, extra_rx=0.0, extra_rz=0.0):
-        """Compute projected geometry for this frame."""
-        ry = (CUBE_SPIN_SPEED * t) % (2 * math.pi)
-        rx = CUBE_TILT_AMOUNT * math.sin(t * CUBE_TILT_SPEED) + extra_rx
-        rz = 0.06 * math.sin(t * 0.7) + extra_rz
-        R = rotation_matrix(rx, ry, rz)
-
-        bob = math.sin(t * CUBE_FLOAT_SPEED) * CUBE_FLOAT_AMP
-
-        verts_cam = _CUBE_OBJ_VERTS @ R.T               # (8,3)
-        z_cam = verts_cam[:, 2]
-        z_proj = z_cam * s * 0.9 + CUBE_FOV
-        scale = CUBE_FOV / np.clip(z_proj, 1.0, None)
-        sx = cx + verts_cam[:, 0] * s * scale
-        sy = (cy + bob) + verts_cam[:, 1] * s * scale
-        verts2d = np.stack([sx, sy], axis=1)
-
-        normals_cam = _CUBE_FACE_NORMALS_OBJ @ R.T      # (6,3)
-        # Depth per face in camera space (mean Z of its 4 verts)
-        face_depths = np.array([verts_cam[list(idx), 2].mean()
-                                 for idx in _CUBE_FACE_IDX])
-        order = np.argsort(-face_depths)                 # back-to-front
-
-        light = dynamic_light_dir(t)
-        faces = []
-        for fi in order:
-            idx    = _CUBE_FACE_IDX[fi]
-            poly   = verts2d[list(idx)]
-            ndotl  = float(np.dot(normals_cam[fi], -light))
-            lit    = LIGHT_AMBIENT + (1.0 - LIGHT_AMBIENT) * max(0.0, ndotl)
-            # Depth-based brightness: far faces are slightly dimmer
-            depth_fade = 0.78 + 0.22 * (1.0 - (face_depths[fi] + 1.0) / 2.0)
-            lit *= depth_fade
-            color = tuple(min(255, int(c * lit)) for c in CLR_CUBE_BASE)
-            # Opacity varies with face angle + depth
-            face_alpha = FACE_ALPHA * (0.5 + 0.5 * max(0.0, ndotl)) * depth_fade
-            faces.append((poly.astype(np.int32), color, face_alpha, lit, fi))
-
-        edges = [(verts2d[a].astype(int), verts2d[b].astype(int))
-                  for a, b in _CUBE_EDGES]
-        return {"verts2d": verts2d, "faces": faces, "edges": edges,
-                "center": (cx, cy + bob), "normals_cam": normals_cam}
-
-    def draw(self, frame, target_x, target_y, s, t, dt,
-             alpha=1.0, glow_strength=0.7,
-             extra_rx=0.0, extra_rz=0.0,
-             build_progress=1.0,
-             palm_velocity=None,
-             enable_shake=True,
-             enable_bloom=True,
-             bloom_sigma_boost=0.0):
-        """
-        Render the holographic cube.
-        target_x/y: where the cube *should* be (palm centre);
-                    actual draw position is spring-smoothed.
-        """
-        if alpha <= 0.01 or s <= 1:
-            return
-
-        self._spring_update((target_x, target_y), max(dt, 1e-4))
-
-        # Velocity-based tilt from hand motion
-        if palm_velocity is not None:
-            vx, vy = palm_velocity[0], palm_velocity[1]
-            self._vel_tilt[0] += (-vy * VEL_TILT_SCALE - self._vel_tilt[0]) * 0.12
-            self._vel_tilt[1] += ( vx * VEL_TILT_SCALE - self._vel_tilt[1]) * 0.12
-        self._vel_tilt *= VEL_TILT_DECAY
-
-        cx, cy = float(self.pos[0]), float(self.pos[1])
-
-        # Hologram flicker
-        flick = flicker_alpha(t)
-
-        # Random glitch: briefly drop alpha + shift geometry
-        glitch_off = np.zeros(2, dtype=np.float32)
-        if t - self._glitch_t > GLITCH_INTERVAL:
-            if np.random.random() < 0.004:          # ~once per GLITCH_INTERVAL at 60fps
-                self._glitch_t = t
-        glitch_active = (t - self._glitch_t) < GLITCH_DURATION
-        if glitch_active:
-            p = (t - self._glitch_t) / GLITCH_DURATION
-            glitch_off = np.array([
-                np.random.uniform(-8, 8),
-                np.random.uniform(-4, 4),
-            ], dtype=np.float32) * (1 - p)
-            flick *= 0.5
-
-        final_alpha = alpha * flick
-        h, w = frame.shape[:2]
-
-        rx_extra = extra_rx + self._vel_tilt[0]
-        rz_extra = extra_rz + self._vel_tilt[1]
-        geo = self.project(cx + glitch_off[0], cy + glitch_off[1],
-                            s, t, extra_rx=rx_extra, extra_rz=rz_extra)
-
-        # Light spill below the cube (hologram light on hand)
-        self._draw_light_spill(frame, cx, cy + s * 0.9, s)
-
-        # Draw faces back-to-front
-        n_faces = len(geo["faces"])
-        for i, (poly, color, face_alpha, lit, fi) in enumerate(geo["faces"]):
-            face_reveal = np.clip(build_progress * n_faces - i, 0.0, 1.0)
-            if face_reveal <= 0.01:
-                continue
-            fa = face_alpha * final_alpha * face_reveal
-            fc = tuple(int(c) for c in color)
-
-            x0 = max(0, int(poly[:, 0].min()) - 2)
-            y0 = max(0, int(poly[:, 1].min()) - 2)
-            x1 = min(w, int(poly[:, 0].max()) + 3)
-            y1 = min(h, int(poly[:, 1].max()) + 3)
-            if x1 <= x0 or y1 <= y0:
-                continue
-            roi = frame[y0:y1, x0:x1]
-            lp  = poly - [x0, y0]
-            fl  = roi.copy()
-            cv2.fillPoly(fl, [lp], fc, lineType=cv2.LINE_AA)
-            cv2.addWeighted(fl, fa, roi, 1 - fa, 0, roi)
-
-        # Energy grid (scanlines + diagonals on front-most face)
-        if glow_strength > 0.05:
-            self._draw_energy_grid(frame, geo, t, final_alpha * glow_strength)
-
-        # Glowing wireframe — with chromatic aberration
-        edge_alpha = final_alpha * glow_strength * EDGE_GLOW_BOOST
-        for p0, p1 in geo["edges"]:
-            # Chromatic aberration: draw R slightly shifted one way, B the other
-            if CHROMA_OFFSET > 0:
-                r_p0 = (p0[0] - CHROMA_OFFSET, p0[1])
-                r_p1 = (p1[0] - CHROMA_OFFSET, p1[1])
-                b_p0 = (p0[0] + CHROMA_OFFSET, p0[1])
-                b_p1 = (p1[0] + CHROMA_OFFSET, p1[1])
-                r_col = (0, 0, min(255, int(CLR_GLOW[2] * edge_alpha * 0.6)))
-                b_col = (min(255, int(CLR_GLOW[0] * edge_alpha * 0.6)), 0, 0)
-                cv2.line(frame, tuple(r_p0), tuple(r_p1), r_col, 1, cv2.LINE_AA)
-                cv2.line(frame, tuple(b_p0), tuple(b_p1), b_col, 1, cv2.LINE_AA)
-            col = tuple(min(255, int(c * edge_alpha)) for c in CLR_GLOW)
-            cv2.line(frame, tuple(p0), tuple(p1), col, 2, cv2.LINE_AA)
-
-        # Corner glow dots
-        for vx in geo["verts2d"]:
-            r   = max(2, int(s * 0.05))
-            col = tuple(min(255, int(c * final_alpha)) for c in CLR_GLOW)
-            cv2.circle(frame, (int(vx[0]), int(vx[1])), r, col, -1, cv2.LINE_AA)
-
-    def _draw_energy_grid(self, frame, geo, t, strength):
-        """Animated scanlines + diagonal mesh lines on the nearest face."""
-        if not geo["faces"]:
-            return
-        poly = geo["faces"][-1][0]
-        x0, y0 = poly[:, 0].min(), poly[:, 1].min()
-        x1, y1 = poly[:, 0].max(), poly[:, 1].max()
-        if x1 - x0 < 6 or y1 - y0 < 6:
-            return
-        n_lines = 6
-        sweep = (t * 0.55) % 1.0
-        # Horizontal scanlines
-        for i in range(n_lines):
-            frac = (i / n_lines + sweep) % 1.0
-            yy   = int(y0 + frac * (y1 - y0))
-            la   = strength * (0.20 + 0.50 * (1 - abs(frac - 0.5) * 2))
-            col  = tuple(min(255, int(c * la)) for c in CLR_GLOW)
-            cv2.line(frame, (int(x0), yy), (int(x1), yy), col, 1, cv2.LINE_AA)
-        # Diagonal mesh lines (cross-hatch gives "data grid" feel)
-        diag_sweep = (t * 0.35) % 1.0
-        for i in range(4):
-            frac = (i / 4 + diag_sweep) % 1.0
-            la   = strength * 0.14
-            col  = tuple(min(255, int(c * la)) for c in CLR_GLOW)
-            xx   = int(x0 + frac * (x1 - x0))
-            cv2.line(frame, (xx, int(y0)), (int(x1), int(y0 + (x1-xx))), col, 1)
-            cv2.line(frame, (int(x0), int(y0 + frac*(y1-y0))),
-                              (int(x0 + (y1-y0)*(1-frac)), int(y1)), col, 1)
-
-    def _draw_light_spill(self, frame, cx, cy, cube_s):
-        """Soft radial glow blob below the cube — simulates hologram light spill."""
-        h, w = frame.shape[:2]
-        r = int(cube_s * 0.65)
-        x, y = int(cx), int(cy)
-        x0 = max(0, x - r); x1 = min(w, x + r)
-        y0 = max(0, y - r); y1 = min(h, y + r)
-        if x1 <= x0 or y1 <= y0:
-            return
-        blob = np.zeros((y1 - y0, x1 - x0, 3), dtype=np.uint8)
-        lx, ly = x - x0, y - y0
-        col  = tuple(int(c * LIGHT_SPILL_ALPHA) for c in CLR_LIGHT_SPILL)
-        cv2.circle(blob, (lx, ly), r, col, -1)
-        blur = cv2.GaussianBlur(blob, (0, 0), sigmaX=r * 0.45)
-        cv2.add(frame[y0:y1, x0:x1], blur, dst=frame[y0:y1, x0:x1])
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# PARTICLE POOL  (v3: 3D positions, depth sort, turbulence)
+# PARTICLE POOL  (3D positions, depth sort, turbulence) — unchanged
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class ParticlePool:
@@ -699,7 +327,7 @@ class ParticlePool:
         n   = self.active_count
         rng = self.rng
         self.alive[:n] = True
-        # Initialize in 3D; Z starts near 0 (cube plane)
+        # Initialize in 3D; Z starts near 0
         self.pos[:n, 0] = origin[0]
         self.pos[:n, 1] = origin[1]
         self.pos[:n, 2] = rng.uniform(-cube_s * 0.3, cube_s * 0.3, n).astype(np.float32)
@@ -810,12 +438,12 @@ _STATE_NAMES = {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CRACK GENERATOR
+# CRACK GENERATOR  (now centred on the hand directly — no cube geometry needed)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class CrackEffect:
     """
-    Pre-generates Voronoi-like crack lines across the cube's projected faces.
+    Pre-generates Voronoi-like crack lines floating above the hand.
     Drawn as hairline bright segments, growing over CRACK_SECS before explosion.
     Cached per explosion (cheap: only recomputed on each detonation).
     """
@@ -823,16 +451,10 @@ class CrackEffect:
     def __init__(self):
         self._lines = []    # list of ((x0,y0),(x1,y1)) in screen space
 
-    def generate(self, cube_geo, cube_s, seed=None):
-        """Build crack lines from cube face bounding boxes."""
+    def generate(self, cx, cy, cube_s, seed=None):
+        """Build crack lines centred on (cx, cy), sized relative to cube_s."""
         rng = np.random.default_rng(seed)
         self._lines.clear()
-        if not cube_geo or not cube_geo["faces"]:
-            return
-        # Gather all face polygon points
-        pts = np.vstack([f[0] for f in cube_geo["faces"]])
-        cx  = float(pts[:, 0].mean())
-        cy  = float(pts[:, 1].mean())
         for _ in range(N_CRACKS):
             ang = rng.uniform(0, 2*math.pi)
             length = rng.uniform(cube_s * 0.4, cube_s * 1.6)
@@ -856,7 +478,7 @@ class CrackEffect:
             cv2.line(frame, p0, p1, (255,255,255), 1, cv2.LINE_AA)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CAMERA SHAKE
+# CAMERA SHAKE  (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class CameraShake:
@@ -891,14 +513,15 @@ class CameraShake:
         return out
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SHATTER SYSTEM  (v3 state machine: adds CRACKING, bloom pulse, 3D rendering)
+# SHATTER SYSTEM  (cube fully removed — only crack/explosion/particle visuals)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class ShatterSystem:
     """
-    Manages the full holographic cube lifecycle for one detected hand.
+    Manages the full shatter lifecycle for one detected hand.
 
     States: INTACT → CRACKING → EXPLODING → FLOATING → ORBIT → CONVERGE → BUILDING → STABILIZE
+    (No cube is drawn in any state — only cracks, particles, and the shockwave.)
     """
 
     def __init__(self, seed=7):
@@ -909,19 +532,15 @@ class ShatterSystem:
         self.ex = self.ey = 0.0
         self.shockwave_t0 = -999.0
         self._bloom_t0    = -999.0
-        self._cached_geo  = None    # last projected cube geometry (for crack generation)
         self._last_draw_t = 0.0
 
-        self.cube    = HoloCube()
         self.pool    = ParticlePool(PARTICLE_POOL_SIZE, seed=seed)
         self.cracks  = CrackEffect()
 
     def _begin_crack(self, now):
         self.state = CRACKING
         self.t0    = now
-        # Generate crack lines from current cube geometry
-        if self._cached_geo:
-            self.cracks.generate(self._cached_geo, self.cube_s, seed=int(now*1000))
+        self.cracks.generate(self.hx, self.hy, self.cube_s, seed=int(now*1000))
 
     def _begin_explosion(self, now):
         self.state = EXPLODING
@@ -978,7 +597,6 @@ class ShatterSystem:
                 self.state = BUILDING
                 self.t0    = now
                 self.pool.deactivate_all()
-                self.cube.reset()
 
         elif self.state == BUILDING:
             if now - self.t0 > LAYER_BUILD_SECS:
@@ -1001,61 +619,21 @@ class ShatterSystem:
             if bd < BLOOM_DECAY_SECS:
                 bloom_boost = BLOOM_PEAK_SIGMA * (1.0 - bd / BLOOM_DECAY_SECS)
 
-        if self.state == INTACT:
-            geo = self.cube.project(self.hx, self.hy, self.cube_s, t)
-            self._cached_geo = geo
-            self.cube.draw(frame, self.hx, self.hy, self.cube_s, t, dt,
-                           alpha=1.0, glow_strength=0.7,
-                           palm_velocity=palm_velocity)
-
-        elif self.state == CHARGING:
-            dt_c  = now - self.t0
-            alpha = min(dt_c / CHARGE_SECS, 1.0)
-            self.cube.draw(frame, self.hx, self.hy, self.cube_s, t, dt,
-                           alpha=alpha * 0.4, glow_strength=alpha,
-                           palm_velocity=palm_velocity)
-
-        elif self.state == CRACKING:
-            # Draw the cube with crack overlay
-            geo = self.cube.project(self.hx, self.hy, self.cube_s, t)
-            self._cached_geo = geo
-            self.cube.draw(frame, self.hx, self.hy, self.cube_s, t, dt,
-                           alpha=1.0, glow_strength=0.85,
-                           palm_velocity=palm_velocity)
+        if self.state == CRACKING:
             crack_prog = min((now - self.t0) / CRACK_SECS, 1.0)
             self.cracks.draw(frame, crack_prog)
+
+        elif self.state in (EXPLODING, FLOATING, ORBIT, CONVERGE):
+            particle_renderer.draw(frame, self.pool, self.ex, self.ey,
+                                    self.cube_s, bloom_boost=bloom_boost)
 
         elif self.state == BUILDING:
             dt_b     = now - self.t0
             progress = min(dt_b / LAYER_BUILD_SECS, 1.0)
-            eased    = progress * progress * (3 - 2 * progress)
-            self.cube.draw(frame, self.hx, self.hy, self.cube_s, t, dt,
-                           alpha=eased, glow_strength=1.0,
-                           build_progress=eased,
-                           palm_velocity=palm_velocity)
             particle_renderer.draw(frame, self.pool, self.ex, self.ey,
-                                    self.cube_s, fade_out=1.0-eased)
+                                    self.cube_s, fade_out=1.0 - progress)
 
-        elif self.state == STABILIZE:
-            dt_st  = now - self.t0
-            flicker = 0.82 + 0.18 * math.sin(dt_st * 38.0) * (1.0 - dt_st / STABILIZE_SECS)
-            self.cube.draw(frame, self.hx, self.hy, self.cube_s, t, dt,
-                           alpha=1.0, glow_strength=flicker,
-                           palm_velocity=palm_velocity)
-
-        else:
-            # EXPLODING / FLOATING / ORBIT / CONVERGE
-            particle_renderer.draw(frame, self.pool, self.ex, self.ey,
-                                    self.cube_s, bloom_boost=bloom_boost)
-
-            if self.state in (ORBIT, CONVERGE):
-                dt_s = now - self.t0
-                dur  = ORBIT_SECS if self.state == ORBIT else CONVERGE_SECS
-                ghost = min(dt_s / dur, 1.0)
-                base  = 0.12 if self.state == ORBIT else 0.12 + 0.45 * ghost
-                self.cube.draw(frame, self.hx, self.hy, self.cube_s, t, dt,
-                               alpha=base, glow_strength=0.4 + 0.6 * ghost,
-                               palm_velocity=palm_velocity)
+        # INTACT, CHARGING, STABILIZE: nothing to draw (no cube anymore)
 
         self._draw_shockwave(frame, now)
 
@@ -1076,13 +654,12 @@ class ShatterSystem:
                        radius, col_sw, thickness, cv2.LINE_AA)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PARTICLE RENDERER  (v3: 3D perspective projection + depth sort)
+# PARTICLE RENDERER  (3D perspective projection + depth sort) — unchanged
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class ParticleRenderer:
     """
     Renders ParticlePool onto a frame ROI.
-    v3 additions:
     • Perspective projection: Z coord scales rendered size and brightness
     • Depth sort: far particles drawn first (painter's algorithm)
     • bloom_sigma_boost: spike at explosion moment
@@ -1213,7 +790,7 @@ class ParticleRenderer:
                 dst=frame[y0:y1, x0:x1])
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# AMBIENT SPARKLES  (unchanged from v2, minor z-wobble added)
+# AMBIENT SPARKLES  (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class AmbientSparkles:
@@ -1243,7 +820,7 @@ class AmbientSparkles:
             cv2.circle(layer, (px, py), max(1, int(self.sz[i])), col, -1, cv2.LINE_AA)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CHARGE EFFECT  (unchanged from v2)
+# CHARGE EFFECT  (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class ChargeEffect:
@@ -1502,4 +1079,4 @@ if __name__ == "__main__":
     main()
 
 # Run with:
-# python cube_shatter_effect.py
+# C:\Users\user\AppData\Local\Programs\Python\Python314\python.exe cube_shatter_effect.py
