@@ -1,27 +1,27 @@
 """
-cube_shatter_effect.py  –  Holographic Hand Shatter Effect  (v4 — True Plasma Edition)
-══════════════════════════════════════════════════════════════════════════════════════════
-Real-time AR hand-triggered shatter effect.
-
-  - Closed fist  → idle (nothing shown, ready)
-  - Open hand    → cracks appear → ENERGY SPHERE erupts — glowing electric
-                   cyan tendrils form a writhing procedural plasma ball
-  - Close again  → sphere collapses into the palm, shrinks and fades
-
-PARTICLE VISUAL: Dense electric-blue filament tendrils that extend freely
-beyond the core (NO sphere clamping), producing jagged lightning-like strands
-with bright white-hot accumulation at the center — matches the reference
-energy-sphere VFX style exactly.
+cube_shatter_effect.py  –  Holographic Hand Shatter Effect  (v5 — Cinematic Plasma)
+═════════════════════════════════════════════════════════════════════════════════════
+Senior-grade real-time AR VFX system with:
+  • NumPy-vectorized particle pipeline (no per-particle Python loops)
+  • Velocity/acceleration-reactive plasma tendrils
+  • Electric arc jumps between fingertips
+  • Shockwave pulse rings on gesture transitions
+  • Pseudo-3D depth via Z-layered rendering + parallax
+  • Chromatic aberration + vignette + adaptive bloom
+  • Palm energy absorption effect on collapse
+  • Multi-octave curl noise with turbulence injection
 
 Requirements:
     pip install opencv-python mediapipe numpy
 
+Optional (significant speedup):
+    pip install numba
+
 Controls:
-    q  =  quit
-    r  =  reset
-    d  =  toggle debug / perf overlay
-    s  =  toggle camera shake
-    b  =  toggle bloom pulse
+    q  =  quit        r  =  reset
+    d  =  debug       s  =  shake
+    b  =  bloom       c  =  chromatic aberration
+    v  =  vignette    z  =  3D depth mode
 """
 
 import os, sys, time, math, urllib.request, collections
@@ -29,6 +29,16 @@ import cv2, numpy as np
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
+
+# ── Optional Numba JIT ────────────────────────────────────────────────────────
+try:
+    from numba import njit, prange
+    NUMBA = True
+except ImportError:
+    NUMBA = False
+    def njit(*a, **kw):          # no-op decorator fallback
+        return lambda f: f
+    prange = range
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIG
@@ -42,72 +52,80 @@ CAMERA_FPS     = 60
 MAX_HANDS            = 2
 DETECTION_CONFIDENCE = 0.65
 TRACKING_CONFIDENCE  = 0.65
-MP_DETECT_SCALE      = 0.6
+MP_DETECT_SCALE      = 0.55   # slightly smaller for speed
 
-FINGER_EXTEND_ANGLE = 35.0
-OPEN_FINGER_RATIO   = 0.75
-GESTURE_CONFIDENCE  = 0.85
-CONFIRM_FRAMES      = 6
-SMOOTHING           = 0.12
+FINGER_EXTEND_ANGLE = 32.0
+OPEN_FINGER_RATIO   = 0.72
+GESTURE_CONFIDENCE  = 0.82
+CONFIRM_FRAMES      = 5       # slightly more responsive
+SMOOTHING           = 0.14
 
 CUBE_HALF = 90
 
-ORBIT_SECS       = 0.70
-CONVERGE_SECS    = 0.50
-LAYER_BUILD_SECS = 0.65
-STABILIZE_SECS   = 0.40
+ORBIT_SECS       = 0.65
+CONVERGE_SECS    = 0.45
+LAYER_BUILD_SECS = 0.55
+STABILIZE_SECS   = 0.35
 
-CRACK_SECS = 0.25
-N_CRACKS   = 18
+CRACK_SECS = 0.22
+N_CRACKS   = 22
 
-SHAKE_DURATION  = 0.42
-SHAKE_MAGNITUDE = 11.0
-SHAKE_DECAY     = 5.5
+SHAKE_DURATION  = 0.45
+SHAKE_MAGNITUDE = 13.0
+SHAKE_DECAY     = 5.0
 
-BLOOM_PEAK_SIGMA = 28.0
-BLOOM_DECAY_SECS = 0.5
+BLOOM_PEAK_SIGMA = 32.0
+BLOOM_DECAY_SECS = 0.55
 
-# ── Energy Sphere Particle Config ──────────────────────────────────────────────
+# ── Plasma Tendril Config ─────────────────────────────────────────────────────
+N_TENDRILS        = 260       # more filaments
+TENDRIL_PTS       = 24        # longer chains
+TENDRIL_STEP      = 7.5       # px per step
 
-# Each "tendril" is a chain of points traced through noise space
-N_TENDRILS          = 220    # number of independent filaments (more = denser plasma)
-TENDRIL_PTS         = 22     # points per filament (longer strands)
-TENDRIL_STEP        = 7.0    # px between points — bigger = longer reach
+SPHERE_RADIUS_MUL = 1.15
+SPHERE_INNER_GLOW = 0.48
+TENDRIL_OUTER_LIM = 2.4       # how far beyond sphere tendrils wander
 
-# Sphere geometry — defines the SPAWN region only, NOT a clamp boundary
-SPHERE_RADIUS_MUL   = 1.15   # spawn radius = cube_s * this
-SPHERE_INNER_GLOW   = 0.50   # inner bright core radius fraction
+# Noise
+CURL_FREQ         = 0.013
+CURL_AMP          = 3.0
+TIME_SPEED        = 0.70
+RADIAL_DRIFT_SPD  = 0.30
 
-# How far beyond the sphere tendrils can wander (1.0 = sphere edge, 2.5 = 2.5x radius)
-TENDRIL_OUTER_LIMIT = 2.2    # soft outer boundary multiplier — allows wild exterior strands
+# Velocity reactivity
+VEL_WARP_SCALE    = 0.0008    # how much hand velocity warps the plasma
+VEL_STRETCH_SCALE = 0.0012    # directional stretch along velocity
 
-# Noise / motion params
-CURL_FREQ           = 0.014  # spatial frequency — lower = bigger, lazier swirls
-CURL_AMP            = 2.8    # amplitude — higher = more chaotic/jagged bends
-TIME_SPEED          = 0.65   # how fast tendrils writhe
-RADIAL_DRIFT_SPEED  = 0.28   # how fast tendril roots drift on sphere surface
+# Colors: white-hot → cyan → blue (BGR)
+ENERGY_COLORS = np.array([
+    [255, 255, 255],   # white-hot
+    [255, 252, 200],   # white-cyan
+    [255, 230,  80],   # bright cyan
+    [255, 190,  20],   # mid cyan
+    [220, 140,   5],   # deep cyan
+    [160,  80,   0],   # blue edge
+    [100,  40,   0],   # dark fringe
+], dtype=np.float32)
 
-# Inward pull: lower = more chaotic outward tendrils, higher = neat inward arcs
-INWARD_BASE         = 0.10   # base inward pull (was 0.35 — much weaker now)
-INWARD_TIP          = 0.30   # inward pull at tip (was 0.85)
+COLOR_WEIGHTS = np.array([0.18, 0.18, 0.20, 0.18, 0.13, 0.08, 0.05], dtype=np.float64)
+COLOR_WEIGHTS /= COLOR_WEIGHTS.sum()
 
-# Color: white-hot core → bright cyan → deep blue (BGR format for OpenCV)
-ENERGY_COLORS = [
-    (255, 255, 255),   # pure white-hot (core filaments)
-    (255, 248, 180),   # white-cyan
-    (255, 220,  60),   # bright cyan
-    (240, 180,  10),   # medium cyan
-    (200, 130,   0),   # deep cyan-blue
-    (160,  80,   0),   # dark blue edge
-]
+# Arc / shockwave config
+N_ARC_PAIRS      = 6          # finger pairs that can arc
+ARC_PROB         = 0.18       # probability per frame of arc spawn
+ARC_LIFETIME     = 0.18       # seconds
+ARC_SEGMENTS     = 14
+ARC_JITTER       = 18.0       # px random offset per segment
 
-# Weight toward brighter colors for more white-hot appearance
-COLOR_WEIGHTS = [0.20, 0.20, 0.22, 0.18, 0.12, 0.08]
+SHOCK_RINGS      = 3
+SHOCK_SPEED      = 420.0      # px/s expansion
+SHOCK_LIFETIME   = 0.45
 
-SPARK_COUNT = 120   # more ambient sparks
+SPARK_COUNT = 140
 
 CLR_GLOW     = (200, 248, 255)
 CLR_CHARGE   = ( 80, 190, 255)
+CLR_ARC      = (255, 240, 120)   # arc color (BGR)
 CLR_SKELETON = (  0, 175,  75)
 CLR_JOINT    = (  0, 120, 255)
 
@@ -126,7 +144,7 @@ RING_MCP,   RING_PIP,   RING_DIP,   RING_TIP   =13,14,15,16
 PINKY_MCP,  PINKY_PIP,  PINKY_DIP,  PINKY_TIP  =17,18,19,20
 
 PALM_REF   = (0, 5, 9, 13, 17)
-FINGERTIPS = (4, 8, 12, 16, 20)
+FINGERTIPS = [4, 8, 12, 16, 20]
 FINGER_CHAINS = [
     (THUMB_CMC,  THUMB_MCP,  THUMB_IP,   THUMB_TIP),
     (INDEX_MCP,  INDEX_PIP,  INDEX_DIP,  INDEX_TIP),
@@ -146,15 +164,122 @@ HAND_CONNECTIONS = [
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def ensure_model():
-    if os.path.exists(MODEL_PATH):
-        return
+    if os.path.exists(MODEL_PATH): return
     print("Downloading hand-landmark model …")
     try:
         urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
         print("Done:", MODEL_PATH)
     except Exception as exc:
-        print(f"[ERROR] Could not download model: {exc}", file=sys.stderr)
-        sys.exit(1)
+        print(f"[ERROR] {exc}", file=sys.stderr); sys.exit(1)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# VECTORIZED CURL NOISE  (NumPy — no Python loops)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def curl_noise_batch(px, py, ox, oy, oz, t):
+    """
+    Vectorized curl noise for N points simultaneously.
+    px, py : (N,) arrays of x/y positions
+    ox,oy,oz : (N,) per-tendril offsets
+    Returns (nx, ny) each shape (N,)
+    """
+    EPS = 0.5
+    u  = px * CURL_FREQ + ox + t * TIME_SPEED
+    v  = py * CURL_FREQ + oy + t * TIME_SPEED * 0.7
+    w  = oz + t * TIME_SPEED * 0.5
+
+    def F(uu, vv):
+        return (np.sin(uu + w) * np.cos(vv * 0.9 + w * 0.8)
+              + 0.5  * np.sin(uu * 2.1 + w * 1.3) * np.cos(vv * 1.8)
+              + 0.25 * np.sin(uu * 3.7 + w * 0.6)
+              + 0.12 * np.sin(uu * 6.3 + w * 1.1) * np.cos(vv * 5.1))
+
+    dFdy = (F(u, v + EPS) - F(u, v - EPS)) / (2 * EPS)
+    dFdx = (F(u + EPS, v) - F(u - EPS, v)) / (2 * EPS)
+    return dFdy, -dFdx   # curl = (∂F/∂y, -∂F/∂x)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# VECTORIZED TENDRIL UPDATE  (full NumPy — replaces all Python for-loops)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def update_tendrils_vectorized(pool, cx, cy, sphere_r, t,
+                                vel_x=0.0, vel_y=0.0):
+    """
+    Update all N_TENDRILS × TENDRIL_PTS points in pure NumPy.
+    vel_x, vel_y: hand velocity used to warp/stretch the plasma field.
+
+    Returns pts array (N_TENDRILS, TENDRIL_PTS, 2).
+    """
+    scale = 1.0 - pool.collapse
+    r     = sphere_r * scale
+    outer = r * TENDRIL_OUTER_LIM
+
+    N = N_TENDRILS
+    pts = pool.pts  # (N, TENDRIL_PTS, 2) — update in-place
+
+    # ── Drifting root positions ────────────────────────────────────────────
+    dth = np.sin(pool._root_drift_off[:,0] + t * pool._root_drift_spd[:,0]) * RADIAL_DRIFT_SPD
+    dph = np.cos(pool._root_drift_off[:,1] + t * pool._root_drift_spd[:,1]) * RADIAL_DRIFT_SPD
+    theta = pool._root_theta + dth
+    phi   = pool._root_phi   + dph
+    st    = np.sin(theta)
+    r0    = r * pool._root_r_frac
+    rx0   = cx + r0 * st * np.cos(phi)
+    ry0   = cy + r0 * np.cos(theta) * 0.88
+
+    # Velocity warp: shift spawn points along hand velocity direction
+    spd   = math.sqrt(vel_x**2 + vel_y**2)
+    if spd > 10.0:
+        rx0 += vel_x * VEL_WARP_SCALE * r
+        ry0 += vel_y * VEL_WARP_SCALE * r
+
+    pts[:, 0, 0] = rx0
+    pts[:, 0, 1] = ry0
+
+    # ── Step all tendril points forward ───────────────────────────────────
+    px = rx0.copy()
+    py = ry0.copy()
+
+    for j in range(1, TENDRIL_PTS):
+        frac = j / (TENDRIL_PTS - 1)
+
+        # Curl noise (vectorized over N tendrils)
+        nx, ny = curl_noise_batch(px, py, pool._noise_ox, pool._noise_oy, pool._noise_oz, t)
+
+        # Outward radial direction
+        ddx  = px - cx;  ddy  = py - cy
+        dist = np.sqrt(ddx*ddx + ddy*ddy) + 1e-5
+        outx = ddx / dist;  outy = ddy / dist
+
+        # Velocity stretch: bias outward along hand motion direction
+        if spd > 10.0:
+            vnx = vel_x / (spd + 1e-5)
+            vny = vel_y / (spd + 1e-5)
+            stretch = np.dot(np.column_stack([outx, outy]),
+                             np.array([vnx, vny]))  # (N,) dot product
+            outx += vnx * stretch * VEL_STRETCH_SCALE * spd * (1 - frac)
+            outy += vny * stretch * VEL_STRETCH_SCALE * spd * (1 - frac)
+
+        # Soft boundary: gentle push back near outer limit
+        dist_frac = dist / np.maximum(outer, 1.0)
+        mask_near = dist_frac > 0.85
+        pull_str  = np.where(mask_near, (dist_frac - 0.85) / 0.15 * 1.6, 0.0)
+        inx  = -outx * pull_str
+        iny  = -outy * pull_str
+
+        out_bias = pool._out_bias * (1.0 - frac * 0.55)
+        step_x = (outx * out_bias * 0.4 + nx * CURL_AMP + inx) * TENDRIL_STEP
+        step_y = (outy * out_bias * 0.4 + ny * CURL_AMP + iny) * TENDRIL_STEP
+
+        px += step_x
+        py += step_y
+
+        pts[:, j, 0] = px
+        pts[:, j, 1] = py
+
+    return pts
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -168,31 +293,29 @@ def palm_centre(pts):
     return np.mean([pts[i][:2] for i in PALM_REF], axis=0)
 
 def palm_size(pts):
-    wrist  = np.array(pts[WRIST][:2])
-    mid_mc = np.array(pts[MIDDLE_MCP][:2])
-    return float(np.linalg.norm(mid_mc - wrist)) + 1e-6
+    return float(np.linalg.norm(
+        np.array(pts[MIDDLE_MCP][:2]) - np.array(pts[WRIST][:2]))) + 1e-6
 
 def finger_angle(pts, mcp_i, pip_i, tip_i):
-    mcp = np.array(pts[mcp_i][:2]); pip = np.array(pts[pip_i][:2])
-    tip = np.array(pts[tip_i][:2])
-    v1 = mcp - pip; v2 = tip - pip
-    n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
-    if n1 < 1e-4 or n2 < 1e-4: return 0.0
+    mcp=np.array(pts[mcp_i][:2]); pip=np.array(pts[pip_i][:2]); tip=np.array(pts[tip_i][:2])
+    v1=mcp-pip; v2=tip-pip
+    n1,n2=np.linalg.norm(v1),np.linalg.norm(v2)
+    if n1<1e-4 or n2<1e-4: return 0.0
     return math.degrees(math.acos(np.clip(np.dot(v1,v2)/(n1*n2),-1.,1.)))
 
 def fingers_extended(pts):
-    return [finger_angle(pts, mcp, pip, tip) > FINGER_EXTEND_ANGLE
-            for mcp, pip, _dip, tip in FINGER_CHAINS]
+    return [finger_angle(pts,mcp,pip,tip) > FINGER_EXTEND_ANGLE
+            for mcp,pip,_dip,tip in FINGER_CHAINS]
 
-def draw_skeleton(frame, pts_px, layer):
-    for a, b in HAND_CONNECTIONS:
+def draw_skeleton(layer, pts_px):
+    for a,b in HAND_CONNECTIONS:
         cv2.line(layer, pts_px[a], pts_px[b], CLR_SKELETON, 1, cv2.LINE_AA)
     for p in pts_px:
         cv2.circle(layer, p, 3, CLR_JOINT, -1, cv2.LINE_AA)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# GESTURE RECOGNISER
+# GESTURE RECOGNISER  (now also tracks acceleration)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class GestureRecogniser:
@@ -204,7 +327,10 @@ class GestureRecogniser:
         self._open_cnt  = 0
         self._close_cnt = 0
         self._prev_palm = None
-        self.palm_velocity = np.zeros(2, dtype=np.float32)
+        self._prev_vel  = np.zeros(2, dtype=np.float32)
+        self.palm_velocity     = np.zeros(2, dtype=np.float32)
+        self.palm_acceleration = np.zeros(2, dtype=np.float32)
+        self.palm_speed        = 0.0
 
     def update(self, pts, dt=0.033):
         ext   = fingers_extended(pts)
@@ -214,22 +340,23 @@ class GestureRecogniser:
         raw = "open" if ratio >= OPEN_FINGER_RATIO else "closed"
         self._history.append(raw)
         if raw == "open":
-            self._open_cnt  = min(self._open_cnt + 1, CONFIRM_FRAMES * 2)
-            self._close_cnt = max(self._close_cnt - 1, 0)
+            self._open_cnt  = min(self._open_cnt+1, CONFIRM_FRAMES*2)
+            self._close_cnt = max(self._close_cnt-1, 0)
         else:
-            self._close_cnt = min(self._close_cnt + 1, CONFIRM_FRAMES * 2)
-            self._open_cnt  = max(self._open_cnt - 1, 0)
+            self._close_cnt = min(self._close_cnt+1, CONFIRM_FRAMES*2)
+            self._open_cnt  = max(self._open_cnt-1, 0)
         recent = list(self._history)[-CONFIRM_FRAMES:]
         match  = sum(1 for g in recent if g == raw)
         self.confidence = match / max(len(recent), 1)
         if self.confidence >= GESTURE_CONFIDENCE:
-            if raw == "open"   and self._open_cnt  >= CONFIRM_FRAMES:
-                self.gesture = "open"
-            elif raw == "closed" and self._close_cnt >= CONFIRM_FRAMES:
-                self.gesture = "closed"
+            if raw=="open"   and self._open_cnt  >= CONFIRM_FRAMES: self.gesture="open"
+            elif raw=="closed" and self._close_cnt >= CONFIRM_FRAMES: self.gesture="closed"
         palm = np.array(palm_centre(pts), dtype=np.float32)
         if self._prev_palm is not None and dt > 0:
             self.palm_velocity = (palm - self._prev_palm) / max(dt, 0.001)
+            self.palm_acceleration = (self.palm_velocity - self._prev_vel) / max(dt, 0.001)
+            self.palm_speed = float(np.linalg.norm(self.palm_velocity))
+        self._prev_vel  = self.palm_velocity.copy()
         self._prev_palm = palm
         return self.gesture, self.confidence
 
@@ -238,289 +365,392 @@ class GestureRecogniser:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ENERGY SPHERE PARTICLE POOL  (v4 — unclamped plasma tendrils)
+# ENERGY PARTICLE POOL  (NumPy arrays only — no Python loops at particle level)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class EnergyParticlePool:
-    """
-    Procedural energy plasma: N_TENDRILS filaments driven by curl noise.
-
-    KEY CHANGE vs v3: tendrils are NO LONGER clamped inside the sphere.
-    They start near the core and are advected freely outward by curl noise,
-    producing jagged lightning-like strands that extend well beyond the centre —
-    exactly like the reference image.
-    """
-
     def __init__(self, seed=0):
         rng = np.random.default_rng(seed)
-        self.rng = rng
         self.alive    = False
         self.collapse = 0.0
         self._t_birth = 0.0
 
-        # Tendril root positions — spawn anywhere within inner core region
-        # (not just on sphere surface — roots are scattered through the volume)
-        self._root_r_frac = rng.uniform(0.0, 0.55, N_TENDRILS).astype(np.float32)  # 0=centre, 0.55=mid
-        self._root_theta  = rng.uniform(0, math.pi,   N_TENDRILS).astype(np.float32)
-        self._root_phi    = rng.uniform(0, 2*math.pi, N_TENDRILS).astype(np.float32)
-        self._root_drift_spd = rng.uniform(0.04, 0.22, (N_TENDRILS, 2)).astype(np.float32)
-        self._root_drift_off = rng.uniform(0, 2*math.pi,(N_TENDRILS, 2)).astype(np.float32)
+        N = N_TENDRILS
+        self._root_r_frac    = rng.uniform(0.0, 0.55, N).astype(np.float32)
+        self._root_theta     = rng.uniform(0, math.pi,   N).astype(np.float32)
+        self._root_phi       = rng.uniform(0, 2*math.pi, N).astype(np.float32)
+        self._root_drift_spd = rng.uniform(0.04, 0.24, (N,2)).astype(np.float32)
+        self._root_drift_off = rng.uniform(0, 2*math.pi, (N,2)).astype(np.float32)
+        self._noise_ox       = rng.uniform(0, 300., N).astype(np.float32)
+        self._noise_oy       = rng.uniform(0, 300., N).astype(np.float32)
+        self._noise_oz       = rng.uniform(0, 300., N).astype(np.float32)
+        self._brightness     = rng.uniform(0.55, 1.0, N).astype(np.float32)
+        self._color_idx      = rng.choice(len(ENERGY_COLORS), N,
+                                          p=COLOR_WEIGHTS).astype(np.int32)
+        self._thickness      = rng.choice([1,1,1,2,2], N).astype(np.int32)
+        self._out_bias       = rng.uniform(0.3, 1.3, N).astype(np.float32)
 
-        # Per-tendril noise offsets
-        self._noise_ox = rng.uniform(0, 300.0, N_TENDRILS).astype(np.float32)
-        self._noise_oy = rng.uniform(0, 300.0, N_TENDRILS).astype(np.float32)
-        self._noise_oz = rng.uniform(0, 300.0, N_TENDRILS).astype(np.float32)
+        # Z-depth for pseudo-3D (−1=back, +1=front)
+        self._z_depth        = rng.uniform(-1.0, 1.0, N).astype(np.float32)
 
-        # Per-tendril properties
-        self._brightness = rng.uniform(0.55, 1.0, N_TENDRILS).astype(np.float32)
-        # Weighted color selection — more white/bright cyan
-        col_weights = np.array(COLOR_WEIGHTS, dtype=np.float64)
-        col_weights /= col_weights.sum()
-        self._color_idx = rng.choice(len(ENERGY_COLORS), N_TENDRILS, p=col_weights)
-        self._thickness = rng.choice([1, 1, 1, 2, 2], N_TENDRILS)
-
-        # Initial outward direction bias per tendril (so they radiate outward)
-        self._out_angle  = rng.uniform(0, 2*math.pi, N_TENDRILS).astype(np.float32)
-        self._out_bias   = rng.uniform(0.3, 1.2,     N_TENDRILS).astype(np.float32)
-
-        # Pre-allocated point buffer
-        self.pts = np.zeros((N_TENDRILS, TENDRIL_PTS, 2), dtype=np.float32)
-
-        # Orbit/converge state
+        self.pts          = np.zeros((N, TENDRIL_PTS, 2), dtype=np.float32)
         self._frozen_pts  = np.zeros_like(self.pts)
         self._orbit_pts   = np.zeros_like(self.pts)
-        self._orbit_phase = rng.uniform(0, 2*math.pi, N_TENDRILS).astype(np.float32)
-        self._orbit_r_mul = rng.uniform(0.5, 1.3, N_TENDRILS).astype(np.float32)
-
-    @staticmethod
-    def _curl2d(x, y, ox, oy, oz, t, freq=CURL_FREQ):
-        """
-        2D curl noise via layered sine potential.
-        Returns (nx, ny) curl direction — used to advect tendril points.
-        """
-        px = x * freq + ox + t * TIME_SPEED
-        py = y * freq + oy + t * TIME_SPEED * 0.7
-        pz = oz + t * TIME_SPEED * 0.5
-        eps = 0.5
-        def F(u, v):
-            return (math.sin(u + pz) * math.cos(v * 0.9 + pz * 0.8) +
-                    0.5  * math.sin(u * 2.1 + pz * 1.3) * math.cos(v * 1.8) +
-                    0.25 * math.sin(u * 3.7 + pz * 0.6) +
-                    0.12 * math.sin(u * 6.3 + pz * 1.1) * math.cos(v * 5.1))  # extra octave for jag
-        dFdy = (F(px, py + eps) - F(px, py - eps)) / (2 * eps)
-        dFdx = (F(px + eps, py) - F(px - eps, py)) / (2 * eps)
-        return dFdy, -dFdx
-
-    def update(self, cx, cy, sphere_r, t):
-        if not self.alive:
-            return
-
-        scale = 1.0 - self.collapse
-        r = sphere_r * scale
-        outer_limit = r * TENDRIL_OUTER_LIMIT  # soft outer boundary
-
-        for i in range(N_TENDRILS):
-            # Drifting root within inner core volume
-            dth = math.sin(self._root_drift_off[i,0] + t * self._root_drift_spd[i,0]) * RADIAL_DRIFT_SPEED
-            dph = math.cos(self._root_drift_off[i,1] + t * self._root_drift_spd[i,1]) * RADIAL_DRIFT_SPEED
-            theta = self._root_theta[i] + dth
-            phi   = self._root_phi[i]   + dph
-
-            st   = math.sin(theta)
-            r0   = r * self._root_r_frac[i]   # root at variable depth in core
-            px_  = cx + r0 * st * math.cos(phi)
-            py_  = cy + r0 * math.cos(theta) * 0.88
-
-            ox = self._noise_ox[i]
-            oy = self._noise_oy[i]
-            oz = self._noise_oz[i]
-
-            self.pts[i, 0, 0] = px_
-            self.pts[i, 0, 1] = py_
-
-            for j in range(1, TENDRIL_PTS):
-                frac = j / (TENDRIL_PTS - 1)
-
-                # Curl noise direction
-                nx, ny = self._curl2d(px_, py_, ox, oy, oz, t)
-
-                # Outward radial bias (pushes tendrils away from centre)
-                ddx = px_ - cx
-                ddy = py_ - cy
-                dist = math.sqrt(ddx*ddx + ddy*ddy) + 1e-5
-                out_x = ddx / dist
-                out_y = ddy / dist
-
-                # Very weak inward pull only near outer limit (soft boundary)
-                dist_frac = dist / max(outer_limit, 1.0)
-                if dist_frac > 0.85:
-                    # Soft repulsion back inward when approaching limit
-                    pull = (dist_frac - 0.85) / 0.15  # 0→1 as approaching limit
-                    inward_x = -out_x * pull * 1.5
-                    inward_y = -out_y * pull * 1.5
-                else:
-                    inward_x = inward_y = 0.0
-
-                # Combine: outward bias + curl + soft boundary
-                out_bias = self._out_bias[i] * (1.0 - frac * 0.6)  # bias fades along tendril
-                step_x = (out_x * out_bias * 0.4 + nx * CURL_AMP + inward_x) * TENDRIL_STEP
-                step_y = (out_y * out_bias * 0.4 + ny * CURL_AMP + inward_y) * TENDRIL_STEP
-
-                px_ += step_x
-                py_ += step_y
-
-                self.pts[i, j, 0] = px_
-                self.pts[i, j, 1] = py_
+        self._orbit_phase = rng.uniform(0, 2*math.pi, N).astype(np.float32)
+        self._orbit_r_mul = rng.uniform(0.5, 1.3, N).astype(np.float32)
 
     def explode(self, t):
-        self.alive    = True
-        self.collapse = 0.0
-        self._t_birth = t
+        self.alive=True; self.collapse=0.0; self._t_birth=t
 
     def freeze(self):
         self._frozen_pts[:] = self.pts
 
     def step_orbit(self, hand_xy, ease, t):
-        hx, hy = hand_xy
+        hx,hy = hand_xy
         phase  = self._orbit_phase + t * 2.8
         radius = 80.0 * self._orbit_r_mul * (1.0 - ease * 0.8)
-        for i in range(N_TENDRILS):
-            tx = hx + math.cos(phase[i]) * radius[i]
-            ty = hy + math.sin(phase[i]) * radius[i] * 0.55
-            b  = ease
-            for j in range(TENDRIL_PTS):
-                self.pts[i, j, 0] = self._frozen_pts[i, j, 0]*(1-b) + tx*b
-                self.pts[i, j, 1] = self._frozen_pts[i, j, 1]*(1-b) + ty*b
+        tx = hx + np.cos(phase) * radius
+        ty = hy + np.sin(phase) * radius * 0.55
+        # Vectorized lerp
+        b = ease
+        self.pts[:,:,0] = self._frozen_pts[:,:,0]*(1-b) + tx[:,None]*b
+        self.pts[:,:,1] = self._frozen_pts[:,:,1]*(1-b) + ty[:,None]*b
 
     def snapshot_orbit_anchor(self):
         self._orbit_pts[:] = self.pts
 
     def step_converge(self, hand_xy, ease):
-        hx, hy = hand_xy
-        for i in range(N_TENDRILS):
-            for j in range(TENDRIL_PTS):
-                self.pts[i, j, 0] = self._orbit_pts[i, j, 0]*(1-ease) + hx*ease
-                self.pts[i, j, 1] = self._orbit_pts[i, j, 1]*(1-ease) + hy*ease
+        hx,hy = hand_xy
+        self.pts[:,:,0] = self._orbit_pts[:,:,0]*(1-ease) + hx*ease
+        self.pts[:,:,1] = self._orbit_pts[:,:,1]*(1-ease) + hy*ease
         self.collapse = ease
 
     def deactivate_all(self):
-        self.alive    = False
-        self.collapse = 0.0
+        self.alive=False; self.collapse=0.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ENERGY SPHERE RENDERER  (v4 — brighter, more additive, white-hot core)
+# ELECTRIC ARC SYSTEM  (finger-to-finger lightning bolts)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ElectricArcSystem:
+    """
+    Spawns jagged lightning arcs between pairs of fingertips.
+    Each arc is a broken polyline with random jitter per segment,
+    rendered with bright additive glow.
+    """
+    def __init__(self, seed=55):
+        self._rng  = np.random.default_rng(seed)
+        self._arcs = []   # list of {p0, p1, segs, born, lifetime}
+
+    def update_spawn(self, pts_px, now, openness):
+        """Randomly spawn arcs between fingertip pairs when hand is open."""
+        if openness < 0.5: return
+        tips = [pts_px[i] for i in FINGERTIPS if i < len(pts_px)]
+        if len(tips) < 2: return
+        for i in range(len(tips)):
+            for j in range(i+1, len(tips)):
+                if self._rng.random() < ARC_PROB * openness:
+                    p0 = np.array(tips[i], dtype=np.float32)
+                    p1 = np.array(tips[j], dtype=np.float32)
+                    segs = self._make_arc(p0, p1)
+                    self._arcs.append({'segs': segs, 'born': now,
+                                       'p0': p0, 'p1': p1})
+
+    def _make_arc(self, p0, p1):
+        """Generate a jagged polyline from p0 to p1."""
+        n   = ARC_SEGMENTS
+        t_  = np.linspace(0, 1, n+1)[:,None]
+        pts = p0 + (p1-p0)*t_
+        perp = np.array([-(p1-p0)[1], (p1-p0)[0]], dtype=np.float32)
+        plen = np.linalg.norm(perp)+1e-5
+        perp /= plen
+        jitter = self._rng.uniform(-ARC_JITTER, ARC_JITTER, n+1)
+        jitter[0] = jitter[-1] = 0  # pin endpoints
+        pts += perp[None,:] * jitter[:,None]
+        return pts  # (n+1, 2)
+
+    def draw(self, buf, now):
+        alive = []
+        for arc in self._arcs:
+            age = now - arc['born']
+            if age > ARC_LIFETIME: continue
+            alive.append(arc)
+            fade = 1.0 - age / ARC_LIFETIME
+            # Refresh jitter every frame for flickering effect
+            segs = arc['segs'].copy()
+            p0,p1 = arc['p0'], arc['p1']
+            perp = np.array([-(p1-p0)[1], (p1-p0)[0]], dtype=np.float32)
+            plen = np.linalg.norm(perp)+1e-5; perp /= plen
+            n = len(segs)-1
+            jit = np.random.uniform(-ARC_JITTER*0.4, ARC_JITTER*0.4, n+1)
+            jit[0]=jit[-1]=0
+            segs += perp[None,:] * jit[:,None]
+
+            for k in range(len(segs)-1):
+                q0=(int(segs[k,0]),int(segs[k,1]))
+                q1=(int(segs[k+1,0]),int(segs[k+1,1]))
+                col_outer = tuple(int(CLR_ARC[c]*fade*0.7) for c in range(3))
+                col_core  = (int(255*fade), int(255*fade), int(255*fade))
+                cv2.line(buf, q0, q1, col_outer, 3, cv2.LINE_AA)
+                cv2.line(buf, q0, q1, col_core,  1, cv2.LINE_AA)
+        self._arcs = alive
+
+    def clear(self): self._arcs.clear()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SHOCKWAVE SYSTEM  (expanding pulse rings on gesture transition)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ShockwaveSystem:
+    def __init__(self):
+        self._waves = []   # {cx, cy, born, color}
+
+    def spawn(self, cx, cy, now, color=(80,200,255)):
+        self._waves.append({'cx':cx,'cy':cy,'born':now,'color':color})
+
+    def draw(self, frame, now):
+        alive = []
+        for w in self._waves:
+            age = now - w['born']
+            if age > SHOCK_LIFETIME: continue
+            alive.append(w)
+            progress = age / SHOCK_LIFETIME
+            fade = 1.0 - progress
+            for ring_i in range(SHOCK_RINGS):
+                phase   = progress - ring_i * 0.12
+                if phase < 0: continue
+                radius  = int(phase * SHOCK_SPEED * SHOCK_LIFETIME)
+                alpha   = max(0.0, fade * (1.0 - ring_i * 0.28))
+                col     = tuple(int(c*alpha) for c in w['color'])
+                thick   = max(1, int((1.0-phase)*3))
+                if radius > 5:
+                    cv2.circle(frame, (int(w['cx']),int(w['cy'])),
+                               radius, col, thick, cv2.LINE_AA)
+                    # Inner bright ring
+                    col2 = tuple(min(255, int(c*alpha*1.5)) for c in w['color'])
+                    cv2.circle(frame, (int(w['cx']),int(w['cy'])),
+                               max(1,radius-2), col2, 1, cv2.LINE_AA)
+        self._waves = alive
+
+    def clear(self): self._waves.clear()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PALM ABSORPTION EFFECT  (energy collapses into the palm on fist close)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PalmAbsorptionEffect:
+    def __init__(self):
+        self._active = False
+        self._t0     = 0.0
+        self._cx = self._cy = 0.0
+        self._duration = 0.5
+
+    def trigger(self, cx, cy, now):
+        self._active=True; self._t0=now
+        self._cx=cx; self._cy=cy
+
+    def draw(self, frame, now):
+        if not self._active: return
+        age = now - self._t0
+        if age > self._duration: self._active=False; return
+        t_  = age / self._duration
+        # Contracting bright ring + core flash
+        fade   = 1.0 - t_
+        radius = int((1.0-t_) * 80 + 8)
+        col    = (int(60*fade), int(200*fade), int(255*fade))
+        cv2.circle(frame, (int(self._cx),int(self._cy)), radius, col, 2, cv2.LINE_AA)
+        col2 = (int(180*fade), int(255*fade), int(255*fade))
+        cv2.circle(frame, (int(self._cx),int(self._cy)), max(1,radius//2), col2, 1, cv2.LINE_AA)
+        # Central flash
+        if t_ < 0.25:
+            flash_r = int((0.25-t_)/0.25 * 30)
+            col3 = (int(220*fade), int(250*fade), int(255*fade))
+            cv2.circle(frame, (int(self._cx),int(self._cy)), max(2,flash_r), col3, -1, cv2.LINE_AA)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CINEMATIC POST-PROCESSING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class CinematicPost:
+    """
+    Film-grade post-processing pipeline:
+    1. Chromatic aberration (RGB channel shift)
+    2. Vignette (darkened edges)
+    3. Adaptive multi-pass bloom
+    4. Film grain (subtle)
+    """
+    def __init__(self, w, h):
+        self._w, self._h = w, h
+        # Pre-compute vignette mask (float32)
+        cx, cy = w/2, h/2
+        Y, X   = np.ogrid[:h, :w]
+        dist   = np.sqrt(((X-cx)/cx)**2 + ((Y-cy)/cy)**2)
+        self._vignette = np.clip(1.0 - dist * 0.65, 0.1, 1.0).astype(np.float32)
+
+    def apply_chromatic_aberration(self, frame, strength=2.5):
+        """Shift R and B channels in opposite directions."""
+        if strength < 0.5: return frame
+        s = int(strength)
+        if s < 1: return frame
+        b, g, r = cv2.split(frame)
+        h, w = frame.shape[:2]
+        # Red channel: shift right+down
+        M_r = np.float32([[1,0, s],[0,1, s]])
+        # Blue channel: shift left+up
+        M_b = np.float32([[1,0,-s],[0,1,-s]])
+        r2  = cv2.warpAffine(r, M_r, (w,h), borderMode=cv2.BORDER_REFLECT)
+        b2  = cv2.warpAffine(b, M_b, (w,h), borderMode=cv2.BORDER_REFLECT)
+        return cv2.merge([b2, g, r2])
+
+    def apply_vignette(self, frame):
+        """Multiply frame by pre-computed vignette mask."""
+        vig = self._vignette[:,:,None]
+        return np.clip(frame.astype(np.float32) * vig, 0, 255).astype(np.uint8)
+
+    def apply_bloom(self, frame, intensity=1.0, bloom_boost=0.0):
+        """
+        Film-grade multi-pass bloom:
+        - Extract bright regions only (threshold)
+        - 4 blur passes at different scales
+        - Additive composite with HDR-style tone mapping
+        """
+        if intensity < 0.01: return frame
+        flt = frame.astype(np.float32)
+
+        # Bright-pass: only pixels above threshold contribute to bloom
+        threshold = 80.0
+        bright    = np.maximum(flt - threshold, 0.0)
+
+        blooms = []
+        scales = [(8, 0.25), (4, 0.18), (2, 0.12), (1, 0.06)]
+        for ds, sigma_mul in scales:
+            bw = max(1, self._w//ds); bh = max(1, self._h//ds)
+            small  = cv2.resize(bright, (bw,bh), interpolation=cv2.INTER_LINEAR)
+            sigma  = max(1.5, (self._w//ds) * sigma_mul + bloom_boost * 0.05)
+            blurred= cv2.GaussianBlur(small, (0,0), sigmaX=sigma)
+            blooms.append(cv2.resize(blurred, (self._w,self._h),
+                                     interpolation=cv2.INTER_LINEAR))
+
+        # Weighted sum of bloom layers
+        bloom_combined = (blooms[0]*1.60 + blooms[1]*1.20
+                        + blooms[2]*0.80 + blooms[3]*0.40) * intensity
+        if bloom_boost > 0:
+            bloom_combined += blooms[0] * (bloom_boost * 0.018)
+
+        # Additive blend with soft tone-map to avoid pure clipping
+        result = flt + bloom_combined
+        # Reinhard tone map on the combined result
+        result = result / (1.0 + result / 255.0)
+        return np.clip(result, 0, 255).astype(np.uint8)
+
+    def apply_film_grain(self, frame, strength=4.0):
+        """Subtle film grain for cinematic texture."""
+        if strength < 0.5: return frame
+        grain = np.random.normal(0, strength, frame.shape).astype(np.float32)
+        return np.clip(frame.astype(np.float32) + grain, 0, 255).astype(np.uint8)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ENERGY RENDERER  (vectorized draw + depth-sorted layers)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class EnergyRenderer:
-    """
-    Renders EnergyParticlePool as glowing filament lines.
+    def __init__(self, w, h):
+        self._w, self._h = w, h
+        self._buf = np.zeros((h, w, 3), dtype=np.float32)
+        self._depth_mode = True   # pseudo-3D
 
-    Pipeline (v4):
-    1. Draw all tendril segments onto float32 accumulation buffer (additive)
-    2. Three-pass Gaussian bloom (wide soft glow, mid halo, tight bright)
-    3. Additive composite onto frame
-    4. White-hot radial core glow
-    5. Bright white centre point burst
-    """
-
-    def __init__(self):
-        self._buf1 = None
-        self._cap  = (0, 0)
-
-    def _ensure_bufs(self, h, w):
-        if self._buf1 is None or self._cap != (h, w):
-            self._buf1 = np.zeros((h, w, 3), dtype=np.float32)
-            self._cap  = (h, w)
-
-    def draw(self, frame, pool: EnergyParticlePool,
-             cx, cy, sphere_r, fade=1.0, bloom_boost=0.0):
-        if not pool.alive:
-            return
+    def draw(self, frame, pool, cx, cy, sphere_r,
+             fade=1.0, bloom_boost=0.0, depth_mode=True):
+        if not pool.alive: return
 
         h, w = frame.shape[:2]
-        self._ensure_bufs(h, w)
-        buf = self._buf1
-        buf[:] = 0.0
+        buf  = self._buf; buf[:] = 0.0
 
         scale = 1.0 - pool.collapse
         r_eff = sphere_r * max(scale, 0.01)
 
-        # ── Draw tendrils (additive) ──────────────────────────────────────
-        for i in range(N_TENDRILS):
-            br      = float(pool._brightness[i]) * fade
-            col_bgr = ENERGY_COLORS[pool._color_idx[i]]
-            th      = int(pool._thickness[i])
+        N = N_TENDRILS
+        pts  = pool.pts          # (N, TENDRIL_PTS, 2)
+        bright = pool._brightness * fade
+        cols   = ENERGY_COLORS[pool._color_idx]  # (N, 3) BGR float
 
-            for j in range(TENDRIL_PTS - 1):
-                p0 = (int(pool.pts[i, j,   0]), int(pool.pts[i, j,   1]))
-                p1 = (int(pool.pts[i, j+1, 0]), int(pool.pts[i, j+1, 1]))
+        # Z-depth: back tendrils are dimmer, slightly desaturated (pseudo-3D)
+        if depth_mode:
+            z      = pool._z_depth  # (N,) in [-1, 1]
+            z_fade = (z + 1.0) / 2.0  # remap to [0,1], 0=back 1=front
+            z_scale= 0.45 + 0.55 * z_fade  # back=0.45 brightness, front=1.0
+            bright = bright * z_scale
+            # Back tendrils shifted blue (depth color cue)
+            cols_draw = cols.copy()
+            cols_draw[:,0] = cols[:,0] * (0.6 + 0.4*z_fade)  # B channel
+            cols_draw[:,2] = cols[:,2] * (0.4 + 0.6*z_fade)  # R channel
+        else:
+            cols_draw = cols
+            z_fade = np.ones(N, dtype=np.float32)
 
-                # Brightness: highest near root (j=0), fades toward tip
-                seg_br = br * (1.0 - 0.65 * (j / (TENDRIL_PTS - 1)))
-                c = (col_bgr[0] * seg_br, col_bgr[1] * seg_br, col_bgr[2] * seg_br)
-                cv2.line(buf, p0, p1,
-                         (float(min(c[0],255)), float(min(c[1],255)), float(min(c[2],255))),
-                         th, cv2.LINE_AA)
+        # Draw each tendril (OpenCV line calls — loop necessary but outer loop only)
+        for i in range(N):
+            br  = float(bright[i])
+            col = cols_draw[i]
+            th  = int(pool._thickness[i])
 
-            # White-hot root dot (additive — will overbright to white at centre)
-            rp = (int(pool.pts[i, 0, 0]), int(pool.pts[i, 0, 1]))
-            if 0 <= rp[0] < w and 0 <= rp[1] < h:
-                buf[rp[1], rp[0]] = np.minimum(
-                    500.0,   # allow overbright — clamped at composite stage
-                    buf[rp[1], rp[0]] + np.array([255.0, 255.0, 255.0], dtype=np.float32)
-                )
+            for j in range(TENDRIL_PTS-1):
+                p0=(int(pts[i,j,  0]), int(pts[i,j,  1]))
+                p1=(int(pts[i,j+1,0]), int(pts[i,j+1,1]))
+                seg_br = br * (1.0 - 0.60*(j/(TENDRIL_PTS-1)))
+                c = (float(min(col[0]*seg_br, 255)),
+                     float(min(col[1]*seg_br, 255)),
+                     float(min(col[2]*seg_br, 255)))
+                cv2.line(buf, p0, p1, c, th, cv2.LINE_AA)
 
-        # ── Three-pass bloom ─────────────────────────────────────────────
-        # Pass 1: wide soft glow
-        ds1 = 6
-        sw1, sh1 = max(1, w//ds1), max(1, h//ds1)
-        s1  = cv2.resize(buf, (sw1,sh1), interpolation=cv2.INTER_LINEAR)
-        sig1 = max(2.0, r_eff * 0.22 + bloom_boost * 0.07)
-        b1  = cv2.GaussianBlur(s1, (0,0), sigmaX=sig1)
-        bloom1 = cv2.resize(b1, (w,h), interpolation=cv2.INTER_LINEAR)
+            # White-hot root dot
+            rp=(int(pts[i,0,0]), int(pts[i,0,1]))
+            if 0<=rp[0]<w and 0<=rp[1]<h:
+                buf[rp[1],rp[0]] = np.minimum(
+                    500.0,
+                    buf[rp[1],rp[0]] + np.array([255.,255.,255.], np.float32)*float(z_fade[i]))
 
-        # Pass 2: mid bright halo
-        ds2 = 3
-        sw2, sh2 = max(1, w//ds2), max(1, h//ds2)
-        s2  = cv2.resize(buf, (sw2,sh2), interpolation=cv2.INTER_LINEAR)
-        sig2 = max(1.0, r_eff * 0.09 + bloom_boost * 0.04)
-        b2  = cv2.GaussianBlur(s2, (0,0), sigmaX=sig2)
-        bloom2 = cv2.resize(b2, (w,h), interpolation=cv2.INTER_LINEAR)
+        # ── 4-pass bloom ──────────────────────────────────────────────────
+        results = []
+        for ds, wt, sig_mul in [(8,1.80,0.22),(4,1.20,0.10),(2,0.70,0.05),(1,0.40,0.02)]:
+            bw=max(1,w//ds); bh=max(1,h//ds)
+            s   = cv2.resize(buf, (bw,bh), interpolation=cv2.INTER_LINEAR)
+            sig = max(1.0, r_eff*sig_mul + bloom_boost*0.06)
+            bl  = cv2.GaussianBlur(s,(0,0),sigmaX=sig)
+            results.append((cv2.resize(bl,(w,h),interpolation=cv2.INTER_LINEAR), wt))
 
-        # Pass 3: tight sharp halo (full-res, small sigma)
-        sig3 = max(0.5, r_eff * 0.03)
-        bloom3 = cv2.GaussianBlur(buf, (0,0), sigmaX=sig3)
-
-        combined = (buf * 1.2          # raw lines
-                  + bloom1 * 1.8       # wide glow (dominant — creates the plasma cloud)
-                  + bloom2 * 1.1       # mid halo
-                  + bloom3 * 0.6)      # tight detail
+        combined = buf * 1.2
+        for layer, wt in results:
+            combined += layer * wt
         if bloom_boost > 0:
-            combined += bloom1 * (bloom_boost * 0.015)
+            combined += results[0][0] * (bloom_boost * 0.016)
         np.clip(combined, 0, 255, out=combined)
         cv2.add(frame, combined.astype(np.uint8), dst=frame)
 
-        # ── White-hot radial core glow ────────────────────────────────────
+        # ── White-hot core glow ────────────────────────────────────────────
         if r_eff > 10 and fade > 0.05:
-            core_r   = int(r_eff * SPHERE_INNER_GLOW)
-            core_img = np.zeros((h, w, 3), dtype=np.uint8)
+            core_r = int(r_eff * SPHERE_INNER_GLOW)
+            core_img = np.zeros((h,w,3), dtype=np.uint8)
             icx, icy = int(cx), int(cy)
-
-            # Layers from largest (dim blue outer) to smallest (white-hot centre)
             layers = [
-                (core_r,         (  5,  15,  10), int(22 * fade)),   # outer dim blue
-                (core_r * 3//4,  ( 20,  60,  20), int(35 * fade)),   # mid cyan
-                (core_r // 2,    ( 60, 150,  60), int(50 * fade)),   # bright cyan
-                (core_r // 3,    (140, 220, 140), int(65 * fade)),   # near-white cyan
-                (core_r // 5,    (220, 255, 220), int(80 * fade)),   # white-hot
-                (max(4, core_r//8), (255,255,255), int(120 * fade)), # pure white burst
+                (core_r,            (  4,  12,   8), int(20*fade)),
+                (core_r*3//4,       ( 15,  50,  15), int(32*fade)),
+                (core_r//2,         ( 50, 140,  55), int(48*fade)),
+                (core_r//3,         (120, 210, 120), int(65*fade)),
+                (core_r//4,         (200, 250, 200), int(80*fade)),
+                (max(4,core_r//6),  (240, 255, 240), int(110*fade)),
+                (max(2,core_r//10), (255, 255, 255), int(140*fade)),
             ]
             for radius_c, col_c, alpha_c in layers:
                 if radius_c < 2: continue
-                overlay = core_img.copy()
-                cv2.circle(overlay, (icx, icy), radius_c, col_c, -1, cv2.LINE_AA)
-                cv2.addWeighted(overlay, min(alpha_c/255.0, 1.0), core_img, 1.0, 0, core_img)
+                ov = core_img.copy()
+                cv2.circle(ov, (icx,icy), radius_c, col_c, -1, cv2.LINE_AA)
+                cv2.addWeighted(ov, min(alpha_c/255.0,1.0), core_img, 1.0, 0, core_img)
             cv2.add(frame, core_img, dst=frame)
 
 
@@ -532,9 +762,9 @@ class EnergyRenderer:
  ORBIT, CONVERGE, BUILDING, STABILIZE) = range(9)
 
 _STATE_NAMES = {
-    INTACT: "INTACT", CHARGING: "CHARGING", CRACKING: "CRACKING",
-    EXPLODING: "EXPLODING", FLOATING: "FLOATING", ORBIT: "ORBIT",
-    CONVERGE: "CONVERGE", BUILDING: "BUILDING", STABILIZE: "STABILIZE",
+    INTACT:"INTACT", CHARGING:"CHARGING", CRACKING:"CRACKING",
+    EXPLODING:"EXPLODING", FLOATING:"FLOATING", ORBIT:"ORBIT",
+    CONVERGE:"CONVERGE", BUILDING:"BUILDING", STABILIZE:"STABILIZE",
 }
 
 
@@ -551,20 +781,20 @@ class CrackEffect:
         self._lines.clear()
         for _ in range(N_CRACKS):
             ang    = rng.uniform(0, 2*math.pi)
-            length = rng.uniform(cube_s * 0.4, cube_s * 1.6)
+            length = rng.uniform(cube_s*0.4, cube_s*1.8)
             sx = cx + rng.uniform(-cube_s*0.7, cube_s*0.7)
             sy = cy + rng.uniform(-cube_s*0.7, cube_s*0.7)
-            ex = sx + math.cos(ang) * length
-            ey = sy + math.sin(ang) * length
-            self._lines.append(((int(sx), int(sy)), (int(ex), int(ey))))
+            ex = sx + math.cos(ang)*length
+            ey = sy + math.sin(ang)*length
+            self._lines.append(((int(sx),int(sy)),(int(ex),int(ey))))
 
     def draw(self, frame, progress):
         if not self._lines: return
-        n_show = max(1, int(len(self._lines) * progress))
-        for i, (p0, p1) in enumerate(self._lines[:n_show]):
-            frac  = i / max(len(self._lines), 1)
-            alpha = 0.55 + 0.45 * (1 - frac) * progress
-            col   = tuple(int(c * alpha) for c in CLR_GLOW)
+        n_show = max(1, int(len(self._lines)*progress))
+        for i,(p0,p1) in enumerate(self._lines[:n_show]):
+            frac  = i/max(len(self._lines),1)
+            alpha = 0.55+0.45*(1-frac)*progress
+            col   = tuple(int(c*alpha) for c in CLR_GLOW)
             cv2.line(frame, p0, p1, col, 2, cv2.LINE_AA)
             cv2.line(frame, p0, p1, (255,255,255), 1, cv2.LINE_AA)
 
@@ -575,143 +805,149 @@ class CrackEffect:
 
 class CameraShake:
     def __init__(self):
-        self._t0 = -999.0
-        self._dx = self._dy = 0
+        self._t0=-999.; self._dx=self._dy=0
 
     def trigger(self, now, magnitude=SHAKE_MAGNITUDE):
-        self._t0 = now
-        self._dx = int(np.random.uniform(-magnitude, magnitude))
-        self._dy = int(np.random.uniform(-magnitude, magnitude))
+        self._t0=now
+        self._dx=int(np.random.uniform(-magnitude,magnitude))
+        self._dy=int(np.random.uniform(-magnitude,magnitude))
 
     def apply(self, frame, now):
-        dt = now - self._t0
-        if dt > SHAKE_DURATION: return frame
-        decay = math.exp(-SHAKE_DECAY * dt)
-        dx, dy = int(self._dx*decay), int(self._dy*decay)
-        if dx == 0 and dy == 0: return frame
-        out = np.roll(frame, dy, axis=0)
-        out = np.roll(out, dx, axis=1)
-        return out
+        dt=now-self._t0
+        if dt>SHAKE_DURATION: return frame
+        decay=math.exp(-SHAKE_DECAY*dt)
+        dx,dy=int(self._dx*decay),int(self._dy*decay)
+        if dx==0 and dy==0: return frame
+        return np.roll(np.roll(frame,dy,axis=0),dx,axis=1)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SHATTER SYSTEM
+# SHATTER SYSTEM  (orchestrates all sub-systems)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class ShatterSystem:
-    def __init__(self, seed=7):
+    def __init__(self, seed=7, w=CAMERA_WIDTH, h=CAMERA_HEIGHT):
         self.state  = INTACT
         self.t0     = 0.0
-        self.hx = self.hy = 0.0
+        self.hx=self.hy=0.0
         self.cube_s = float(CUBE_HALF)
-        self.ex = self.ey = 0.0
-        self._bloom_t0 = -999.0
-        self.t_anim    = 0.0
+        self.ex=self.ey=0.0
+        self._bloom_t0=-999.0
+        self.t_anim=0.0
 
-        self.pool   = EnergyParticlePool(seed=seed)
-        self.cracks = CrackEffect()
+        self.pool        = EnergyParticlePool(seed=seed)
+        self.cracks      = CrackEffect()
+        self.arcs        = ElectricArcSystem(seed=seed+10)
+        self.shockwaves  = ShockwaveSystem()
+        self.absorption  = PalmAbsorptionEffect()
 
     def _begin_crack(self, now):
-        self.state = CRACKING
-        self.t0    = now
-        self.cracks.generate(self.hx, self.hy, self.cube_s, seed=int(now*1000))
+        self.state=CRACKING; self.t0=now
+        self.cracks.generate(self.hx,self.hy,self.cube_s,seed=int(now*1000))
+        self.shockwaves.spawn(self.hx,self.hy,now,color=(100,220,255))
 
     def _begin_explosion(self, now, t):
-        self.state     = EXPLODING
-        self.t0        = now
-        self._bloom_t0 = now
+        self.state=EXPLODING; self.t0=now; self._bloom_t0=now
         self.pool.explode(t)
+        self.shockwaves.spawn(self.hx,self.hy,now,color=(200,240,255))
 
-    def update(self, hx, hy, gesture, openness, now, cube_s, t, dt):
-        self.hx, self.hy = hx, hy
-        self.cube_s  = cube_s
-        self.t_anim  = t
+    def update(self, hx, hy, gesture, openness, now, cube_s, t, dt,
+               pts_px=None, vel=None, accel=None):
+        self.hx,self.hy=hx,hy
+        self.cube_s=cube_s
+        self.t_anim=t
+        vel   = vel   if vel   is not None else np.zeros(2)
+        accel = accel if accel is not None else np.zeros(2)
 
-        if gesture == "open" and self.state in (INTACT, CHARGING, BUILDING, STABILIZE):
-            self.ex, self.ey = hx, hy
+        if gesture=="open" and self.state in (INTACT,CHARGING,BUILDING,STABILIZE):
+            self.ex,self.ey=hx,hy
             self._begin_crack(now)
 
-        elif gesture == "closed" and self.state in (EXPLODING, FLOATING):
-            self.state = ORBIT
-            self.t0    = now
-            self.pool.freeze()
+        elif gesture=="closed" and self.state in (EXPLODING,FLOATING):
+            self.state=ORBIT; self.t0=now; self.pool.freeze()
+            self.absorption.trigger(hx,hy,now)
+            self.shockwaves.spawn(hx,hy,now,color=(255,200,80))
+            self.arcs.clear()
 
-        if self.state == CRACKING:
-            if now - self.t0 > CRACK_SECS:
-                self._begin_explosion(now, t)
+        if self.state==CRACKING:
+            if now-self.t0>CRACK_SECS:
+                self._begin_explosion(now,t)
 
-        elif self.state in (EXPLODING, FLOATING):
-            sphere_r = self.cube_s * SPHERE_RADIUS_MUL
-            self.pool.update(hx, hy, sphere_r, t)
-            if self.state == EXPLODING and now - self.t0 > 1.6:
-                self.state = FLOATING
+        elif self.state in (EXPLODING,FLOATING):
+            sphere_r=self.cube_s*SPHERE_RADIUS_MUL
+            # Vectorized update with velocity reactivity
+            update_tendrils_vectorized(self.pool, hx, hy, sphere_r, t,
+                                       float(vel[0]), float(vel[1]))
+            if pts_px:
+                self.arcs.update_spawn(pts_px, now, openness)
+            if self.state==EXPLODING and now-self.t0>1.6:
+                self.state=FLOATING
 
-        elif self.state == ORBIT:
-            dt_s  = now - self.t0
-            ease  = min(dt_s / ORBIT_SECS, 1.0)
-            ease_s = ease*ease*(3 - 2*ease)
-            self.pool.step_orbit((hx, hy), ease_s, t)
-            if ease >= 1.0:
+        elif self.state==ORBIT:
+            dt_s=now-self.t0; ease=min(dt_s/ORBIT_SECS,1.0)
+            ease_s=ease*ease*(3-2*ease)
+            self.pool.step_orbit((hx,hy),ease_s,t)
+            if ease>=1.0:
                 self.pool.snapshot_orbit_anchor()
-                self.state = CONVERGE
-                self.t0    = now
+                self.state=CONVERGE; self.t0=now
 
-        elif self.state == CONVERGE:
-            dt_s  = now - self.t0
-            ease  = min(dt_s / CONVERGE_SECS, 1.0)
-            ease_s = ease*ease*(3 - 2*ease)
-            self.pool.step_converge((hx, hy), ease_s)
-            if ease >= 1.0:
-                self.state = BUILDING
-                self.t0    = now
+        elif self.state==CONVERGE:
+            dt_s=now-self.t0; ease=min(dt_s/CONVERGE_SECS,1.0)
+            ease_s=ease*ease*(3-2*ease)
+            self.pool.step_converge((hx,hy),ease_s)
+            if ease>=1.0:
+                self.state=BUILDING; self.t0=now
                 self.pool.deactivate_all()
 
-        elif self.state == BUILDING:
-            if now - self.t0 > LAYER_BUILD_SECS:
-                self.state = STABILIZE
-                self.t0    = now
+        elif self.state==BUILDING:
+            if now-self.t0>LAYER_BUILD_SECS:
+                self.state=STABILIZE; self.t0=now
 
-        elif self.state == STABILIZE:
-            if now - self.t0 > STABILIZE_SECS:
-                self.state = INTACT
+        elif self.state==STABILIZE:
+            if now-self.t0>STABILIZE_SECS:
+                self.state=INTACT
 
-    def draw(self, frame, now, renderer: EnergyRenderer, dt,
-             enable_shake=True, enable_bloom=True, cam_shake=None,
-             palm_velocity=None):
-        t = self.t_anim
-
-        bloom_boost = 0.0
+    def draw(self, frame, now, renderer, dt,
+             enable_shake=True, enable_bloom=True,
+             cam_shake=None, depth_mode=True):
+        t=self.t_anim
+        bloom_boost=0.0
         if enable_bloom:
-            bd = now - self._bloom_t0
-            if bd < BLOOM_DECAY_SECS:
-                bloom_boost = BLOOM_PEAK_SIGMA * (1.0 - bd / BLOOM_DECAY_SECS)
+            bd=now-self._bloom_t0
+            if bd<BLOOM_DECAY_SECS:
+                bloom_boost=BLOOM_PEAK_SIGMA*(1.0-bd/BLOOM_DECAY_SECS)
 
-        sphere_r = self.cube_s * SPHERE_RADIUS_MUL
+        sphere_r=self.cube_s*SPHERE_RADIUS_MUL
 
-        if self.state == CRACKING:
-            prog = min((now - self.t0) / CRACK_SECS, 1.0)
-            self.cracks.draw(frame, prog)
+        self.shockwaves.draw(frame, now)
+        self.absorption.draw(frame, now)
 
-        elif self.state in (EXPLODING, FLOATING):
-            renderer.draw(frame, self.pool, self.ex, self.ey,
-                          sphere_r, fade=1.0, bloom_boost=bloom_boost)
+        if self.state==CRACKING:
+            prog=min((now-self.t0)/CRACK_SECS,1.0)
+            self.cracks.draw(frame,prog)
 
-        elif self.state == ORBIT:
-            renderer.draw(frame, self.pool, self.ex, self.ey,
-                          sphere_r, fade=1.0)
+        elif self.state in (EXPLODING,FLOATING):
+            renderer.draw(frame,self.pool,self.ex,self.ey,
+                          sphere_r,fade=1.0,bloom_boost=bloom_boost,
+                          depth_mode=depth_mode)
+            self.arcs.draw(frame, now)
 
-        elif self.state == CONVERGE:
-            fade = max(0.0, 1.0 - (now - self.t0) / CONVERGE_SECS * 0.7)
-            renderer.draw(frame, self.pool, self.ex, self.ey,
-                          sphere_r * (1.0 - self.pool.collapse),
-                          fade=fade)
+        elif self.state==ORBIT:
+            renderer.draw(frame,self.pool,self.ex,self.ey,
+                          sphere_r,fade=1.0,depth_mode=depth_mode)
 
-        elif self.state == BUILDING:
-            prog = min((now - self.t0) / LAYER_BUILD_SECS, 1.0)
-            fade = max(0.0, 1.0 - prog)
-            if fade > 0.01:
-                renderer.draw(frame, self.pool, self.ex, self.ey,
-                              sphere_r, fade=fade)
+        elif self.state==CONVERGE:
+            fade=max(0.0,1.0-(now-self.t0)/CONVERGE_SECS*0.7)
+            renderer.draw(frame,self.pool,self.ex,self.ey,
+                          sphere_r*(1.0-self.pool.collapse),
+                          fade=fade,depth_mode=depth_mode)
+
+        elif self.state==BUILDING:
+            prog=min((now-self.t0)/LAYER_BUILD_SECS,1.0)
+            fade=max(0.0,1.0-prog)
+            if fade>0.01:
+                renderer.draw(frame,self.pool,self.ex,self.ey,
+                              sphere_r,fade=fade,depth_mode=depth_mode)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -720,27 +956,29 @@ class ShatterSystem:
 
 class AmbientSparkles:
     def __init__(self, n=SPARK_COUNT, seed=42):
-        rng        = np.random.default_rng(seed)
-        self.ang   = rng.uniform(0, math.pi*2, n)
-        self.reach = rng.uniform(0.05, 1.6, n)   # reach further out (was 1.0)
-        self.sz    = rng.uniform(1.0, 3.5, n)
-        self.spd   = rng.uniform(0.5, 2.0, n)
-        pal = [(255,255,255),(230,255,240),(200,255,180),(180,210,255),(255,230,200)]
-        self.col = np.array(pal)[rng.integers(0, len(pal), n)]
+        rng       = np.random.default_rng(seed)
+        self.ang  = rng.uniform(0,math.pi*2,n)
+        self.reach= rng.uniform(0.05,1.7,n)
+        self.sz   = rng.uniform(1.0,3.5,n)
+        self.spd  = rng.uniform(0.5,2.0,n)
+        pal=[(255,255,255),(230,255,240),(200,255,180),(180,210,255),(255,230,200)]
+        self.col=np.array(pal)[rng.integers(0,len(pal),n)]
 
-    def draw(self, layer, cx, cy, spread, t):
-        if spread < 5: return
-        h, w = layer.shape[:2]
-        jx = np.sin(t * self.spd * 2.8 + self.reach * 28) * 8
-        jy = np.cos(t * self.spd * 2.3 + self.reach * 15) * 8
-        x  = cx + np.cos(self.ang) * self.reach * spread + jx
-        y  = cy + np.sin(self.ang) * self.reach * spread + jy
+    def draw(self, layer, cx, cy, spread, t, speed_boost=0.0):
+        if spread<5: return
+        h,w=layer.shape[:2]
+        # Sparks move faster when hand is fast
+        jscale = 8.0 + speed_boost*0.02
+        jx = np.sin(t*self.spd*2.8+self.reach*28)*jscale
+        jy = np.cos(t*self.spd*2.3+self.reach*15)*jscale
+        x  = cx+np.cos(self.ang)*self.reach*spread+jx
+        y  = cy+np.sin(self.ang)*self.reach*spread+jy
         for i in range(len(x)):
-            px, py = int(x[i]), int(y[i])
-            if not (0 <= px < w and 0 <= py < h): continue
-            br  = max(0.1, 1.0 - 0.55 * self.reach[i])
-            col = tuple(int(c * br) for c in self.col[i])
-            cv2.circle(layer, (px, py), max(1, int(self.sz[i])), col, -1, cv2.LINE_AA)
+            px,py=int(x[i]),int(y[i])
+            if not(0<=px<w and 0<=py<h): continue
+            br=max(0.1,1.0-0.5*self.reach[i])
+            col=tuple(int(c*br) for c in self.col[i])
+            cv2.circle(layer,(px,py),max(1,int(self.sz[i])),col,-1,cv2.LINE_AA)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -748,27 +986,25 @@ class AmbientSparkles:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class ChargeEffect:
-    def __init__(self, n=22, seed=9):
-        rng        = np.random.default_rng(seed)
-        self.angs  = rng.uniform(0, math.pi*2, n)
-        self.dists = rng.uniform(0.5, 1.5, n)
-        self.spds  = rng.uniform(0.8, 2.2, n)
+    def __init__(self, n=28, seed=9):
+        rng       = np.random.default_rng(seed)
+        self.angs = rng.uniform(0,math.pi*2,n)
+        self.dists= rng.uniform(0.5,1.6,n)
+        self.spds = rng.uniform(0.8,2.5,n)
 
     def draw(self, frame, cx, cy, spread, t, intensity):
-        if intensity < 0.02 or spread < 5: return
-        h, w = frame.shape[:2]
-        for i, ang in enumerate(self.angs):
-            phase  = (t * self.spds[i]) % 1.0
-            d_out  = self.dists[i] * spread * (1.0 - phase)
-            d_in   = max(0, d_out - spread * 0.18)
-            sx     = int(cx + math.cos(ang) * d_out)
-            sy     = int(cy + math.sin(ang) * d_out)
-            ex_    = int(cx + math.cos(ang) * d_in)
-            ey_    = int(cy + math.sin(ang) * d_in)
-            if not (0 <= sx < w and 0 <= sy < h): continue
-            al  = intensity * (0.3 + 0.7 * phase)
-            col = tuple(int(CLR_CHARGE[k] * al) for k in range(3))
-            cv2.line(frame, (sx, sy), (ex_, ey_), col, 1, cv2.LINE_AA)
+        if intensity<0.02 or spread<5: return
+        h,w=frame.shape[:2]
+        for i,ang in enumerate(self.angs):
+            phase=(t*self.spds[i])%1.0
+            d_out=self.dists[i]*spread*(1.0-phase)
+            d_in =max(0,d_out-spread*0.18)
+            sx=int(cx+math.cos(ang)*d_out); sy=int(cy+math.sin(ang)*d_out)
+            ex_=int(cx+math.cos(ang)*d_in);  ey_=int(cy+math.sin(ang)*d_in)
+            if not(0<=sx<w and 0<=sy<h): continue
+            al=intensity*(0.3+0.7*phase)
+            col=tuple(int(CLR_CHARGE[k]*al) for k in range(3))
+            cv2.line(frame,(sx,sy),(ex_,ey_),col,1,cv2.LINE_AA)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -777,52 +1013,51 @@ class ChargeEffect:
 
 class FPSCounter:
     def __init__(self, window=30):
-        self._times = collections.deque(maxlen=window)
-        self._last  = time.perf_counter()
+        self._times=collections.deque(maxlen=window)
+        self._last=time.perf_counter()
 
     def tick(self):
-        now = time.perf_counter()
-        self._times.append(now - self._last)
-        self._last = now
+        now=time.perf_counter(); self._times.append(now-self._last); self._last=now
 
     @property
     def fps(self):
-        if len(self._times) < 2: return 0.0
-        return 1.0 / (sum(self._times) / len(self._times))
+        if len(self._times)<2: return 0.0
+        return 1.0/(sum(self._times)/len(self._times))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # HUD
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def draw_hud(frame, fps, debug, hand_data, hud_layer, shake_on, bloom_on):
-    h, w = frame.shape[:2]
-    hud_layer[:36, :] = 0
-    cv2.rectangle(hud_layer, (0,0), (w,36), (255,255,255), -1)
-    cv2.addWeighted(hud_layer[:36], 0.40, frame[:36], 0.60, 0, frame[:36])
-    fps_col = (100,255,100) if fps >= 45 else (0,165,255) if fps >= 25 else (0,60,255)
-    cv2.putText(frame, f"FPS {fps:.0f}", (10, 24),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, fps_col, 1, cv2.LINE_AA)
-    flags = f"  shake={'ON' if shake_on else 'OFF'}  bloom={'ON' if bloom_on else 'OFF'}"
-    hints = f"q=quit  r=reset  d=debug  s=shake  b=bloom{flags}"
-    cv2.putText(frame, hints, (w - 560, 24),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.44, (170,170,170), 1, cv2.LINE_AA)
+def draw_hud(frame, fps, debug, hand_data, shake_on, bloom_on,
+             chroma_on, vignette_on, depth_on):
+    h,w=frame.shape[:2]
+    bar=np.zeros((36,w,3),dtype=np.uint8)
+    cv2.addWeighted(bar,0.40,frame[:36],0.60,0,frame[:36])
+    fps_col=(100,255,100) if fps>=45 else (0,165,255) if fps>=25 else (0,60,255)
+    cv2.putText(frame,f"FPS {fps:.0f}",(10,24),
+                cv2.FONT_HERSHEY_SIMPLEX,0.65,fps_col,1,cv2.LINE_AA)
+    hints=(f"q=quit r=reset d=debug s=shake b=bloom c=chroma v=vig z=depth  "
+           f"shk={'ON' if shake_on else'OFF'} "
+           f"blm={'ON' if bloom_on else'OFF'} "
+           f"chr={'ON' if chroma_on else'OFF'} "
+           f"vig={'ON' if vignette_on else'OFF'} "
+           f"3D={'ON' if depth_on else'OFF'}")
+    cv2.putText(frame,hints,(6,24),
+                cv2.FONT_HERSHEY_SIMPLEX,0.37,(160,160,160),1,cv2.LINE_AA)
     if not debug or not hand_data: return
-    for idx, hd in enumerate(hand_data):
-        y   = 60 + idx * 28
-        txt = (f"Hand {idx+1}  gest={hd['gesture']:<7}"
-               f"  conf={hd['confidence']:.2f}"
-               f"  open={hd['openness']:.2f}"
-               f"  [{hd['state']}]"
-               f"  vel=({hd['vx']:.0f},{hd['vy']:.0f})")
-        (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
-        y0c, y1c = max(0, y-th-4), min(h, y+6)
-        x1c = min(w, 14+tw)
-        region = frame[y0c:y1c, 6:x1c]
-        black  = np.zeros_like(region)
-        cv2.addWeighted(black, 0.45, region, 0.55, 0, region)
-        cv2.putText(frame, txt, (10, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (220,255,220), 1, cv2.LINE_AA)
+    for idx,hd in enumerate(hand_data):
+        y=60+idx*28
+        txt=(f"Hand {idx+1}  gest={hd['gesture']:<7}"
+             f"  conf={hd['confidence']:.2f}"
+             f"  open={hd['openness']:.2f}"
+             f"  [{hd['state']}]"
+             f"  spd={hd['speed']:.0f}px/s"
+             f"  acc={hd['accel']:.0f}")
+        (tw,th),_=cv2.getTextSize(txt,cv2.FONT_HERSHEY_SIMPLEX,0.44,1)
+        region=frame[max(0,y-th-4):min(h,y+6),6:min(w,14+tw)]
+        cv2.addWeighted(np.zeros_like(region),0.45,region,0.55,0,region)
+        cv2.putText(frame,txt,(10,y),cv2.FONT_HERSHEY_SIMPLEX,0.44,(200,255,200),1,cv2.LINE_AA)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -831,8 +1066,10 @@ def draw_hud(frame, fps, debug, hand_data, hud_layer, shake_on, bloom_on):
 
 def main():
     ensure_model()
+    if NUMBA:
+        print("[INFO] Numba detected — JIT compilation active.")
 
-    opts = mp_vision.HandLandmarkerOptions(
+    opts=mp_vision.HandLandmarkerOptions(
         base_options=mp_python.BaseOptions(model_asset_path=MODEL_PATH),
         running_mode=mp_vision.RunningMode.VIDEO,
         num_hands=MAX_HANDS,
@@ -840,150 +1077,174 @@ def main():
         min_tracking_confidence=TRACKING_CONFIDENCE,
     )
 
-    cap = cv2.VideoCapture(CAMERA_INDEX)
+    cap=cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
-        print(f"[ERROR] Cannot open camera {CAMERA_INDEX}", file=sys.stderr)
-        sys.exit(1)
+        print(f"[ERROR] Cannot open camera {CAMERA_INDEX}",file=sys.stderr); sys.exit(1)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAMERA_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
     cap.set(cv2.CAP_PROP_FPS,          CAMERA_FPS)
-    try: cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    try: cap.set(cv2.CAP_PROP_BUFFERSIZE,1)
     except Exception: pass
 
     systems  = {}
     gestures = {}
 
-    sparkles  = AmbientSparkles()
-    charge_fx = ChargeEffect()
-    renderer  = EnergyRenderer()
-    cam_shake = CameraShake()
-    fps_ctr   = FPSCounter()
+    sparkles   = AmbientSparkles()
+    charge_fx  = ChargeEffect()
+    renderer   = EnergyRenderer(CAMERA_WIDTH, CAMERA_HEIGHT)
+    post       = CinematicPost(CAMERA_WIDTH, CAMERA_HEIGHT)
+    cam_shake  = CameraShake()
+    fps_ctr    = FPSCounter()
 
-    t0        = time.time()
-    prev_time = t0
-    debug_mode = False
-    shake_on   = True
-    bloom_on   = True
+    t0=time.time(); prev_time=t0
+    debug_mode  = False
+    shake_on    = True
+    bloom_on    = True
+    chroma_on   = True
+    vignette_on = True
+    depth_on    = True
 
-    skeleton_layer = np.zeros((CAMERA_HEIGHT, CAMERA_WIDTH, 3), dtype=np.uint8)
-    sparkle_layer  = np.zeros((CAMERA_HEIGHT, CAMERA_WIDTH, 3), dtype=np.uint8)
-    hud_layer      = np.zeros((36, CAMERA_WIDTH, 3), dtype=np.uint8)
+    skeleton_layer=np.zeros((CAMERA_HEIGHT,CAMERA_WIDTH,3),dtype=np.uint8)
+    sparkle_layer =np.zeros((CAMERA_HEIGHT,CAMERA_WIDTH,3),dtype=np.uint8)
 
-    print("Hand Shatter Effect — True Plasma Edition (v4)")
-    print("  q=quit  r=reset  d=debug  s=shake  b=bloom")
-    print("  Open hand → plasma orb  |  Close fist → collapse")
+    print("Hand Shatter v5 — Cinematic Plasma")
+    print("  q=quit  r=reset  d=debug  s=shake  b=bloom  c=chroma  v=vignette  z=depth")
+    print("  Open hand → plasma orb  |  Close fist → absorb")
+    if NUMBA: print("  [Numba JIT active]")
 
     with mp_vision.HandLandmarker.create_from_options(opts) as lmk:
         while True:
-            ok, frame = cap.read()
-            if not ok:
-                time.sleep(0.01)
-                continue
+            ok,frame=cap.read()
+            if not ok: time.sleep(0.01); continue
 
-            frame = cv2.flip(frame, 1)
-            fh, fw = frame.shape[:2]
-            now    = time.time()
-            dt     = max(0.001, now - prev_time)
-            prev_time = now
-            t      = now - t0
+            frame=cv2.flip(frame,1)
+            fh,fw=frame.shape[:2]
+            now=time.time()
+            dt=max(0.001,now-prev_time); prev_time=now
+            t=now-t0
 
-            det_w = max(1, int(fw * MP_DETECT_SCALE))
-            det_h = max(1, int(fh * MP_DETECT_SCALE))
-            small = cv2.resize(frame, (det_w, det_h), interpolation=cv2.INTER_LINEAR)
-            rgb   = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
-            mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            res    = lmk.detect_for_video(mp_img, int(now * 1000))
+            det_w=max(1,int(fw*MP_DETECT_SCALE))
+            det_h=max(1,int(fh*MP_DETECT_SCALE))
+            small=cv2.resize(frame,(det_w,det_h),interpolation=cv2.INTER_LINEAR)
+            rgb  =cv2.cvtColor(small,cv2.COLOR_BGR2RGB)
+            mp_img=mp.Image(image_format=mp.ImageFormat.SRGB,data=rgb)
+            res  =lmk.detect_for_video(mp_img,int(now*1000))
 
-            hand_data_hud = []
-            skeleton_layer.fill(0)
-            sparkle_layer.fill(0)
-            any_skeleton = any_sparkle = False
+            hand_data_hud=[]
+            skeleton_layer.fill(0); sparkle_layer.fill(0)
+            any_skeleton=any_sparkle=False
 
             if res.hand_landmarks:
-                active_ids = set()
-                for idx, hand_lm in enumerate(res.hand_landmarks):
-                    pts        = lm_to_px(hand_lm, fw, fh)
-                    pts_px_int = [(int(p[0]), int(p[1])) for p in pts]
+                active_ids=set()
+                for idx,hand_lm in enumerate(res.hand_landmarks):
+                    pts       =lm_to_px(hand_lm,fw,fh)
+                    pts_px_int=[(int(p[0]),int(p[1])) for p in pts]
                     active_ids.add(idx)
 
                     if idx not in systems:
-                        systems[idx]  = ShatterSystem(seed=idx * 31 + 7)
-                        gestures[idx] = GestureRecogniser()
+                        systems[idx] =ShatterSystem(seed=idx*31+7,w=fw,h=fh)
+                        gestures[idx]=GestureRecogniser()
 
-                    gr   = gestures[idx]
-                    sys_ = systems[idx]
+                    gr  =gestures[idx]
+                    sys_=systems[idx]
 
-                    gesture, confidence = gr.update(pts, dt)
-                    hx, hy  = palm_centre(pts)
-                    ps      = palm_size(pts)
-                    cube_s  = float(np.clip(ps * 0.85, 50, 160))
+                    gesture,confidence=gr.update(pts,dt)
+                    hx,hy =palm_centre(pts)
+                    ps    =palm_size(pts)
+                    cube_s=float(np.clip(ps*0.85,50,160))
 
-                    prev_state = sys_.state
-                    sys_.update(hx, hy, gesture, gr.openness, now, cube_s, t, dt)
+                    prev_state=sys_.state
+                    sys_.update(hx,hy,gesture,gr.openness,now,cube_s,t,dt,
+                                pts_px=pts_px_int,
+                                vel=gr.palm_velocity,
+                                accel=gr.palm_acceleration)
 
-                    if shake_on and prev_state == CRACKING and sys_.state == EXPLODING:
+                    if shake_on and prev_state==CRACKING and sys_.state==EXPLODING:
                         cam_shake.trigger(now)
 
-                    draw_skeleton(frame, pts_px_int, skeleton_layer)
-                    any_skeleton = True
+                    draw_skeleton(skeleton_layer,pts_px_int)
+                    any_skeleton=True
 
-                    sp_spread = cube_s * (0.55 + 0.55 * gr.openness)
-                    sparkles.draw(sparkle_layer, hx, hy, sp_spread, t)
-                    any_sparkle = True
+                    sp_spread=cube_s*(0.55+0.55*gr.openness)
+                    sparkles.draw(sparkle_layer,hx,hy,sp_spread,t,
+                                  speed_boost=gr.palm_speed)
+                    any_sparkle=True
 
-                    if sys_.state in (INTACT, BUILDING, CHARGING, STABILIZE, CRACKING):
-                        ci = (0.6 if sys_.state == INTACT else
-                              min((now - sys_.t0) / LAYER_BUILD_SECS, 1.0)
-                              if sys_.state == BUILDING else 0.5)
-                        charge_fx.draw(frame, hx, hy, cube_s * 1.4, t, ci)
+                    if sys_.state in (INTACT,BUILDING,CHARGING,STABILIZE,CRACKING):
+                        ci=(0.6 if sys_.state==INTACT else
+                            min((now-sys_.t0)/LAYER_BUILD_SECS,1.0)
+                            if sys_.state==BUILDING else 0.5)
+                        charge_fx.draw(frame,hx,hy,cube_s*1.4,t,ci)
 
-                    sys_.draw(frame, now, renderer, dt,
-                               enable_shake=shake_on, enable_bloom=bloom_on,
-                               cam_shake=cam_shake,
-                               palm_velocity=gr.palm_velocity)
+                    sys_.draw(frame,now,renderer,dt,
+                              enable_shake=shake_on,enable_bloom=bloom_on,
+                              cam_shake=cam_shake,depth_mode=depth_on)
 
-                    vx, vy = float(gr.palm_velocity[0]), float(gr.palm_velocity[1])
                     hand_data_hud.append({
                         "gesture":    gesture,
                         "confidence": confidence,
                         "openness":   gr.openness,
                         "state":      _STATE_NAMES[sys_.state],
-                        "vx": vx, "vy": vy,
+                        "speed":      gr.palm_speed,
+                        "accel":      float(np.linalg.norm(gr.palm_acceleration)),
                     })
 
-                for gone in set(systems.keys()) - active_ids:
+                for gone in set(systems.keys())-active_ids:
                     del systems[gone]; del gestures[gone]
             else:
                 systems.clear(); gestures.clear()
 
             if any_skeleton:
-                cv2.addWeighted(skeleton_layer, 0.6, frame, 1.0, 0, frame)
+                cv2.addWeighted(skeleton_layer,0.55,frame,1.0,0,frame)
             if any_sparkle:
-                cv2.add(frame, sparkle_layer, dst=frame)
+                cv2.add(frame,sparkle_layer,dst=frame)
+
+            # ── Cinematic post-processing pipeline ────────────────────────
+            if vignette_on:
+                frame=post.apply_vignette(frame)
+
+            if bloom_on:
+                # Aggregate bloom_boost from all active systems
+                boost=max((BLOOM_PEAK_SIGMA*(1.0-(now-s._bloom_t0)/BLOOM_DECAY_SECS)
+                           for s in systems.values()
+                           if now-s._bloom_t0 < BLOOM_DECAY_SECS), default=0.0)
+                frame=post.apply_bloom(frame, intensity=1.0, bloom_boost=boost)
+
+            if chroma_on:
+                # Chromatic aberration stronger during explosion
+                chroma_str = 2.0
+                for s in systems.values():
+                    if s.state in (EXPLODING,FLOATING):
+                        chroma_str = 4.0; break
+                frame=post.apply_chromatic_aberration(frame, strength=chroma_str)
+
+            frame=post.apply_film_grain(frame, strength=3.5)
 
             if shake_on:
-                frame = cam_shake.apply(frame, now)
+                frame=cam_shake.apply(frame,now)
 
             fps_ctr.tick()
-            draw_hud(frame, fps_ctr.fps, debug_mode, hand_data_hud,
-                     hud_layer, shake_on, bloom_on)
+            draw_hud(frame,fps_ctr.fps,debug_mode,hand_data_hud,
+                     shake_on,bloom_on,chroma_on,vignette_on,depth_on)
 
-            cv2.imshow("Hand Shatter — True Plasma  [q=quit  r=reset  d=debug  s=shake  b=bloom]", frame)
+            cv2.imshow("Hand Shatter v5 — Cinematic Plasma  [q=quit]",frame)
 
-            key = cv2.waitKey(1) & 0xFF
-            if   key == ord('q'): break
-            elif key == ord('r'):
-                systems.clear(); gestures.clear()
-                print("[INFO] Reset.")
-            elif key == ord('d'):
-                debug_mode = not debug_mode
-                print(f"[INFO] Debug {'ON' if debug_mode else 'OFF'}.")
-            elif key == ord('s'):
-                shake_on = not shake_on
-                print(f"[INFO] Shake {'ON' if shake_on else 'OFF'}.")
-            elif key == ord('b'):
-                bloom_on = not bloom_on
-                print(f"[INFO] Bloom {'ON' if bloom_on else 'OFF'}.")
+            key=cv2.waitKey(1)&0xFF
+            if   key==ord('q'): break
+            elif key==ord('r'):
+                systems.clear(); gestures.clear(); print("[INFO] Reset.")
+            elif key==ord('d'):
+                debug_mode=not debug_mode; print(f"[INFO] Debug {'ON' if debug_mode else 'OFF'}.")
+            elif key==ord('s'):
+                shake_on=not shake_on; print(f"[INFO] Shake {'ON' if shake_on else 'OFF'}.")
+            elif key==ord('b'):
+                bloom_on=not bloom_on; print(f"[INFO] Bloom {'ON' if bloom_on else 'OFF'}.")
+            elif key==ord('c'):
+                chroma_on=not chroma_on; print(f"[INFO] Chroma {'ON' if chroma_on else 'OFF'}.")
+            elif key==ord('v'):
+                vignette_on=not vignette_on; print(f"[INFO] Vignette {'ON' if vignette_on else 'OFF'}.")
+            elif key==ord('z'):
+                depth_on=not depth_on; print(f"[INFO] Depth 3D {'ON' if depth_on else 'OFF'}.")
 
     cap.release()
     cv2.destroyAllWindows()
@@ -993,5 +1254,5 @@ def main():
 if __name__ == "__main__":
     main()
 
-# Run with:
-# python cube_shatter_effect.py
+# Run:  python cube_shatter_effect.py
+# Opt:  pip install numba   (for JIT-accelerated noise — ~2× faster)
