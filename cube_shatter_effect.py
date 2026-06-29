@@ -19,7 +19,6 @@ Optional (significant speedup):
 Controls:
     q  =  quit        r  =  reset
     d  =  debug       s  =  shake
-    c  =  chromatic aberration
 """
 
 import os, sys, time, math, urllib.request, collections
@@ -68,13 +67,17 @@ STABILIZE_SECS   = 0.35
 CRACK_SECS = 0.22
 N_CRACKS   = 22
 
+# Finger control (FLOATING state)
+FINGER_ATTRACT_SPEED = 6.0    # px/frame the orb moves toward finger
+FINGER_ATTRACT_DIST  = 40     # px dead-zone — orb snaps freely within this
+
 SHAKE_DURATION  = 0.45
 SHAKE_MAGNITUDE = 13.0
 SHAKE_DECAY     = 5.0
 
 # ── Plasma Tendril Config ─────────────────────────────────────────────────────
-N_TENDRILS        = 260       # more filaments
-TENDRIL_PTS       = 24        # longer chains
+N_TENDRILS        = 110       # reduced for 30+ FPS
+TENDRIL_PTS       = 16        # shorter chains = faster update
 TENDRIL_STEP      = 7.5       # px per step
 
 SPHERE_RADIUS_MUL = 1.15
@@ -107,16 +110,16 @@ COLOR_WEIGHTS /= COLOR_WEIGHTS.sum()
 
 # Arc / shockwave config
 N_ARC_PAIRS      = 6          # finger pairs that can arc
-ARC_PROB         = 0.18       # probability per frame of arc spawn
-ARC_LIFETIME     = 0.18       # seconds
-ARC_SEGMENTS     = 14
-ARC_JITTER       = 18.0       # px random offset per segment
+ARC_PROB         = 0.06       # fewer arcs = less lightning clutter
+ARC_LIFETIME     = 0.15       # seconds
+ARC_SEGMENTS     = 10
+ARC_JITTER       = 16.0       # px random offset per segment
 
 SHOCK_RINGS      = 3
 SHOCK_SPEED      = 420.0      # px/s expansion
 SHOCK_LIFETIME   = 0.45
 
-SPARK_COUNT = 140
+SPARK_COUNT = 60
 
 CLR_GLOW     = (200, 248, 255)
 CLR_CHARGE   = ( 80, 190, 255)
@@ -564,26 +567,17 @@ class PalmAbsorptionEffect:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CHROMATIC ABERRATION  (standalone — vignette and bloom removed)
+# FILM GRAIN  (cheap cinematic texture — chromatic aberration removed for FPS)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def apply_chromatic_aberration(frame, strength=2.5):
-    """Shift R and B channels in opposite directions."""
+def apply_film_grain(frame, strength=3.0):
+    """Subtle film grain — runs on half-res then upscales for speed."""
     if strength < 0.5: return frame
-    s = int(strength)
-    if s < 1: return frame
-    b, g, r = cv2.split(frame)
     h, w = frame.shape[:2]
-    M_r = np.float32([[1,0, s],[0,1, s]])
-    M_b = np.float32([[1,0,-s],[0,1,-s]])
-    r2  = cv2.warpAffine(r, M_r, (w,h), borderMode=cv2.BORDER_REFLECT)
-    b2  = cv2.warpAffine(b, M_b, (w,h), borderMode=cv2.BORDER_REFLECT)
-    return cv2.merge([b2, g, r2])
-
-def apply_film_grain(frame, strength=4.0):
-    """Subtle film grain for cinematic texture."""
-    if strength < 0.5: return frame
-    grain = np.random.normal(0, strength, frame.shape).astype(np.float32)
+    # Generate grain at half res and upscale — 4× faster than full-res
+    gh, gw = h//2, w//2
+    grain = np.random.normal(0, strength, (gh, gw, 3)).astype(np.float32)
+    grain = cv2.resize(grain, (w, h), interpolation=cv2.INTER_LINEAR)
     return np.clip(frame.astype(np.float32) + grain, 0, 255).astype(np.uint8)
 
 
@@ -633,9 +627,9 @@ class EnergyRenderer:
                     500.0,
                     buf[rp[1],rp[0]] + np.array([255.,255.,255.], np.float32))
 
-        # ── 4-pass bloom ──────────────────────────────────────────────────
+        # ── 2-pass bloom (fast) ───────────────────────────────────────────
         results = []
-        for ds, wt, sig_mul in [(8,1.80,0.22),(4,1.20,0.10),(2,0.70,0.05),(1,0.40,0.02)]:
+        for ds, wt, sig_mul in [(6,1.80,0.20),(2,0.80,0.06)]:
             bw=max(1,w//ds); bh=max(1,h//ds)
             s   = cv2.resize(buf, (bw,bh), interpolation=cv2.INTER_LINEAR)
             sig = max(1.0, r_eff*sig_mul)
@@ -749,6 +743,10 @@ class ShatterSystem:
         self.cube_s = float(CUBE_HALF)
         self.ex=self.ey=0.0
         self.t_anim=0.0
+        # Finger-controlled orb position (used in FLOATING state)
+        self.orb_x = 0.0
+        self.orb_y = 0.0
+        self._orb_controlled = False
         self.pool        = EnergyParticlePool(seed=seed)
         self.cracks      = CrackEffect()
         self.arcs        = ElectricArcSystem(seed=seed+10)
@@ -763,6 +761,9 @@ class ShatterSystem:
     def _begin_explosion(self, now, t):
         self.state=EXPLODING; self.t0=now
         self.pool.explode(t)
+        self.orb_x = self.hx
+        self.orb_y = self.hy
+        self._orb_controlled = False
         self.shockwaves.spawn(self.hx,self.hy,now,color=(200,240,255))
 
     def update(self, hx, hy, gesture, openness, now, cube_s, t, dt,
@@ -775,6 +776,7 @@ class ShatterSystem:
 
         if gesture=="open" and self.state in (INTACT,CHARGING,BUILDING,STABILIZE):
             self.ex,self.ey=hx,hy
+            self.orb_x=hx; self.orb_y=hy
             self._begin_crack(now)
 
         elif gesture=="closed" and self.state in (EXPLODING,FLOATING):
@@ -782,20 +784,51 @@ class ShatterSystem:
             self.absorption.trigger(hx,hy,now)
             self.shockwaves.spawn(hx,hy,now,color=(255,200,80))
             self.arcs.clear()
+            self._orb_controlled=False
 
         if self.state==CRACKING:
             if now-self.t0>CRACK_SECS:
                 self._begin_explosion(now,t)
 
-        elif self.state in (EXPLODING,FLOATING):
+        elif self.state==EXPLODING:
             sphere_r=self.cube_s*SPHERE_RADIUS_MUL
-            # Vectorized update with velocity reactivity
-            update_tendrils_vectorized(self.pool, hx, hy, sphere_r, t,
-                                       float(vel[0]), float(vel[1]))
+            # During explosion phase, orb stays at palm
+            self.orb_x=hx; self.orb_y=hy
+            update_tendrils_vectorized(self.pool, self.orb_x, self.orb_y,
+                                       sphere_r, t, float(vel[0]), float(vel[1]))
             if pts_px:
                 self.arcs.update_spawn(pts_px, now, openness)
-            if self.state==EXPLODING and now-self.t0>1.6:
+            if now-self.t0>1.6:
                 self.state=FLOATING
+                self._orb_controlled=False
+
+        elif self.state==FLOATING:
+            sphere_r=self.cube_s*SPHERE_RADIUS_MUL
+
+            # ── Finger control: index fingertip (landmark 8) attracts the orb ──
+            if pts_px and len(pts_px) > 8:
+                fx = float(pts_px[8][0])   # index fingertip x
+                fy = float(pts_px[8][1])   # index fingertip y
+                dx = fx - self.orb_x
+                dy = fy - self.orb_y
+                dist = math.sqrt(dx*dx + dy*dy)
+                if dist > FINGER_ATTRACT_DIST:
+                    # Smooth lerp toward fingertip — speed scales with distance
+                    speed = min(FINGER_ATTRACT_SPEED * (dist / 80.0), dist)
+                    self.orb_x += dx / dist * speed
+                    self.orb_y += dy / dist * speed
+                    self._orb_controlled=True
+                    # Spawn occasional shockwave when moving fast
+                    if dist > 120 and np.random.random() < 0.04:
+                        self.shockwaves.spawn(self.orb_x, self.orb_y, now,
+                                              color=(60,180,255))
+
+            update_tendrils_vectorized(self.pool, self.orb_x, self.orb_y,
+                                       sphere_r, t, float(vel[0])*0.3, float(vel[1])*0.3)
+            if pts_px:
+                self.arcs.update_spawn(pts_px, now, openness)
+            # Update explosion anchor so converge starts from orb position
+            self.ex=self.orb_x; self.ey=self.orb_y
 
         elif self.state==ORBIT:
             dt_s=now-self.t0; ease=min(dt_s/ORBIT_SECS,1.0)
@@ -833,16 +866,26 @@ class ShatterSystem:
             prog=min((now-self.t0)/CRACK_SECS,1.0)
             self.cracks.draw(frame,prog)
 
-        elif self.state in (EXPLODING,FLOATING):
-            renderer.draw(frame,self.pool,self.ex,self.ey,sphere_r,fade=1.0)
+        elif self.state==EXPLODING:
+            renderer.draw(frame,self.pool,self.orb_x,self.orb_y,sphere_r,fade=1.0)
             self.arcs.draw(frame, now)
 
+        elif self.state==FLOATING:
+            renderer.draw(frame,self.pool,self.orb_x,self.orb_y,sphere_r,fade=1.0)
+            self.arcs.draw(frame, now)
+            # Draw finger-attract indicator: subtle line from index tip to orb
+            # (only when orb is being pulled and has moved away from palm)
+            if self._orb_controlled:
+                ox,oy=int(self.orb_x),int(self.orb_y)
+                cv2.circle(frame,(ox,oy),6,(80,200,255),1,cv2.LINE_AA)
+                cv2.circle(frame,(ox,oy),3,(200,240,255),-1,cv2.LINE_AA)
+
         elif self.state==ORBIT:
-            renderer.draw(frame,self.pool,self.ex,self.ey,sphere_r,fade=1.0)
+            renderer.draw(frame,self.pool,self.orb_x,self.orb_y,sphere_r,fade=1.0)
 
         elif self.state==CONVERGE:
             fade=max(0.0,1.0-(now-self.t0)/CONVERGE_SECS*0.7)
-            renderer.draw(frame,self.pool,self.ex,self.ey,
+            renderer.draw(frame,self.pool,self.orb_x,self.orb_y,
                           sphere_r*(1.0-self.pool.collapse),fade=fade)
 
         elif self.state==BUILDING:
@@ -931,18 +974,18 @@ class FPSCounter:
 # HUD
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def draw_hud(frame, fps, debug, hand_data, shake_on, chroma_on):
+def draw_hud(frame, fps, debug, hand_data, shake_on):
     h,w=frame.shape[:2]
     bar=np.zeros((36,w,3),dtype=np.uint8)
     cv2.addWeighted(bar,0.40,frame[:36],0.60,0,frame[:36])
-    fps_col=(100,255,100) if fps>=45 else (0,165,255) if fps>=25 else (0,60,255)
+    fps_col=(100,255,100) if fps>=30 else (0,165,255) if fps>=20 else (0,60,255)
     cv2.putText(frame,f"FPS {fps:.0f}",(10,24),
                 cv2.FONT_HERSHEY_SIMPLEX,0.65,fps_col,1,cv2.LINE_AA)
-    hints=(f"q=quit  r=reset  d=debug  s=shake  c=chroma  "
+    hints=(f"q=quit  r=reset  d=debug  s=shake  "
            f"shk={'ON' if shake_on else 'OFF'}  "
-           f"chr={'ON' if chroma_on else 'OFF'}")
+           f"[open hand=orb | index finger=move orb | fist=absorb]")
     cv2.putText(frame,hints,(6,24),
-                cv2.FONT_HERSHEY_SIMPLEX,0.42,(160,160,160),1,cv2.LINE_AA)
+                cv2.FONT_HERSHEY_SIMPLEX,0.38,(160,160,160),1,cv2.LINE_AA)
     if not debug or not hand_data: return
     for idx,hd in enumerate(hand_data):
         y=60+idx*28
@@ -996,14 +1039,13 @@ def main():
     t0=time.time(); prev_time=t0
     debug_mode  = False
     shake_on    = True
-    chroma_on   = True
 
     skeleton_layer=np.zeros((CAMERA_HEIGHT,CAMERA_WIDTH,3),dtype=np.uint8)
     sparkle_layer =np.zeros((CAMERA_HEIGHT,CAMERA_WIDTH,3),dtype=np.uint8)
 
     print("Hand Shatter v5 — Cinematic Plasma")
-    print("  q=quit  r=reset  d=debug  s=shake  c=chroma")
-    print("  Open hand → plasma orb  |  Close fist → absorb")
+    print("  q=quit  r=reset  d=debug  s=shake")
+    print("  Open hand → orb  |  Index finger → move orb  |  Fist → absorb")
     if NUMBA: print("  [Numba JIT active]")
 
     with mp_vision.HandLandmarker.create_from_options(opts) as lmk:
@@ -1094,21 +1136,13 @@ def main():
                 cv2.add(frame,sparkle_layer,dst=frame)
 
             # ── Post-processing ───────────────────────────────────────────
-            if chroma_on:
-                chroma_str = 2.0
-                for s in systems.values():
-                    if s.state in (EXPLODING,FLOATING):
-                        chroma_str = 4.0; break
-                frame=apply_chromatic_aberration(frame, strength=chroma_str)
-
-            frame=apply_film_grain(frame, strength=3.5)
+            frame=apply_film_grain(frame, strength=3.0)
 
             if shake_on:
                 frame=cam_shake.apply(frame,now)
 
             fps_ctr.tick()
-            draw_hud(frame,fps_ctr.fps,debug_mode,hand_data_hud,
-                     shake_on,chroma_on)
+            draw_hud(frame,fps_ctr.fps,debug_mode,hand_data_hud,shake_on)
 
             cv2.imshow("Hand Shatter v5 — Cinematic Plasma  [q=quit]",frame)
 
@@ -1120,8 +1154,6 @@ def main():
                 debug_mode=not debug_mode; print(f"[INFO] Debug {'ON' if debug_mode else 'OFF'}.")
             elif key==ord('s'):
                 shake_on=not shake_on; print(f"[INFO] Shake {'ON' if shake_on else 'OFF'}.")
-            elif key==ord('c'):
-                chroma_on=not chroma_on; print(f"[INFO] Chroma {'ON' if chroma_on else 'OFF'}.")
 
     cap.release()
     cv2.destroyAllWindows()
