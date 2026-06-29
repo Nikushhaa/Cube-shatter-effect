@@ -6,8 +6,7 @@ Senior-grade real-time AR VFX system with:
   • Velocity/acceleration-reactive plasma tendrils
   • Electric arc jumps between fingertips
   • Shockwave pulse rings on gesture transitions
-  • Pseudo-3D depth via Z-layered rendering + parallax
-  • Chromatic aberration + vignette + adaptive bloom
+  • Chromatic aberration + film grain
   • Palm energy absorption effect on collapse
   • Multi-octave curl noise with turbulence injection
 
@@ -20,8 +19,7 @@ Optional (significant speedup):
 Controls:
     q  =  quit        r  =  reset
     d  =  debug       s  =  shake
-    b  =  bloom       c  =  chromatic aberration
-    v  =  vignette    z  =  3D depth mode
+    c  =  chromatic aberration
 """
 
 import os, sys, time, math, urllib.request, collections
@@ -74,9 +72,6 @@ SHAKE_DURATION  = 0.45
 SHAKE_MAGNITUDE = 13.0
 SHAKE_DECAY     = 5.0
 
-BLOOM_PEAK_SIGMA = 32.0
-BLOOM_DECAY_SECS = 0.55
-
 # ── Plasma Tendril Config ─────────────────────────────────────────────────────
 N_TENDRILS        = 260       # more filaments
 TENDRIL_PTS       = 24        # longer chains
@@ -84,7 +79,7 @@ TENDRIL_STEP      = 7.5       # px per step
 
 SPHERE_RADIUS_MUL = 1.15
 SPHERE_INNER_GLOW = 0.48
-TENDRIL_OUTER_LIM = 2.4       # how far beyond sphere tendrils wander
+TENDRIL_OUTER_LIM = 2.4
 
 # Noise
 CURL_FREQ         = 0.013
@@ -390,9 +385,6 @@ class EnergyParticlePool:
         self._thickness      = rng.choice([1,1,1,2,2], N).astype(np.int32)
         self._out_bias       = rng.uniform(0.3, 1.3, N).astype(np.float32)
 
-        # Z-depth for pseudo-3D (−1=back, +1=front)
-        self._z_depth        = rng.uniform(-1.0, 1.0, N).astype(np.float32)
-
         self.pts          = np.zeros((N, TENDRIL_PTS, 2), dtype=np.float32)
         self._frozen_pts  = np.zeros_like(self.pts)
         self._orbit_pts   = np.zeros_like(self.pts)
@@ -572,86 +564,27 @@ class PalmAbsorptionEffect:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CINEMATIC POST-PROCESSING
+# CHROMATIC ABERRATION  (standalone — vignette and bloom removed)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class CinematicPost:
-    """
-    Film-grade post-processing pipeline:
-    1. Chromatic aberration (RGB channel shift)
-    2. Vignette (darkened edges)
-    3. Adaptive multi-pass bloom
-    4. Film grain (subtle)
-    """
-    def __init__(self, w, h):
-        self._w, self._h = w, h
-        # Pre-compute vignette mask (float32)
-        cx, cy = w/2, h/2
-        Y, X   = np.ogrid[:h, :w]
-        dist   = np.sqrt(((X-cx)/cx)**2 + ((Y-cy)/cy)**2)
-        self._vignette = np.clip(1.0 - dist * 0.65, 0.1, 1.0).astype(np.float32)
+def apply_chromatic_aberration(frame, strength=2.5):
+    """Shift R and B channels in opposite directions."""
+    if strength < 0.5: return frame
+    s = int(strength)
+    if s < 1: return frame
+    b, g, r = cv2.split(frame)
+    h, w = frame.shape[:2]
+    M_r = np.float32([[1,0, s],[0,1, s]])
+    M_b = np.float32([[1,0,-s],[0,1,-s]])
+    r2  = cv2.warpAffine(r, M_r, (w,h), borderMode=cv2.BORDER_REFLECT)
+    b2  = cv2.warpAffine(b, M_b, (w,h), borderMode=cv2.BORDER_REFLECT)
+    return cv2.merge([b2, g, r2])
 
-    def apply_chromatic_aberration(self, frame, strength=2.5):
-        """Shift R and B channels in opposite directions."""
-        if strength < 0.5: return frame
-        s = int(strength)
-        if s < 1: return frame
-        b, g, r = cv2.split(frame)
-        h, w = frame.shape[:2]
-        # Red channel: shift right+down
-        M_r = np.float32([[1,0, s],[0,1, s]])
-        # Blue channel: shift left+up
-        M_b = np.float32([[1,0,-s],[0,1,-s]])
-        r2  = cv2.warpAffine(r, M_r, (w,h), borderMode=cv2.BORDER_REFLECT)
-        b2  = cv2.warpAffine(b, M_b, (w,h), borderMode=cv2.BORDER_REFLECT)
-        return cv2.merge([b2, g, r2])
-
-    def apply_vignette(self, frame):
-        """Multiply frame by pre-computed vignette mask."""
-        vig = self._vignette[:,:,None]
-        return np.clip(frame.astype(np.float32) * vig, 0, 255).astype(np.uint8)
-
-    def apply_bloom(self, frame, intensity=1.0, bloom_boost=0.0):
-        """
-        Film-grade multi-pass bloom:
-        - Extract bright regions only (threshold)
-        - 4 blur passes at different scales
-        - Additive composite with HDR-style tone mapping
-        """
-        if intensity < 0.01: return frame
-        flt = frame.astype(np.float32)
-
-        # Bright-pass: only pixels above threshold contribute to bloom
-        threshold = 80.0
-        bright    = np.maximum(flt - threshold, 0.0)
-
-        blooms = []
-        scales = [(8, 0.25), (4, 0.18), (2, 0.12), (1, 0.06)]
-        for ds, sigma_mul in scales:
-            bw = max(1, self._w//ds); bh = max(1, self._h//ds)
-            small  = cv2.resize(bright, (bw,bh), interpolation=cv2.INTER_LINEAR)
-            sigma  = max(1.5, (self._w//ds) * sigma_mul + bloom_boost * 0.05)
-            blurred= cv2.GaussianBlur(small, (0,0), sigmaX=sigma)
-            blooms.append(cv2.resize(blurred, (self._w,self._h),
-                                     interpolation=cv2.INTER_LINEAR))
-
-        # Weighted sum of bloom layers
-        bloom_combined = (blooms[0]*1.60 + blooms[1]*1.20
-                        + blooms[2]*0.80 + blooms[3]*0.40) * intensity
-        if bloom_boost > 0:
-            bloom_combined += blooms[0] * (bloom_boost * 0.018)
-
-        # Additive blend with soft tone-map to avoid pure clipping
-        result = flt + bloom_combined
-        # Reinhard tone map on the combined result
-        result = result / (1.0 + result / 255.0)
-        return np.clip(result, 0, 255).astype(np.uint8)
-
-    def apply_film_grain(self, frame, strength=4.0):
-        """Subtle film grain for cinematic texture."""
-        if strength < 0.5: return frame
-        grain = np.random.normal(0, strength, frame.shape).astype(np.float32)
-        return np.clip(frame.astype(np.float32) + grain, 0, 255).astype(np.uint8)
+def apply_film_grain(frame, strength=4.0):
+    """Subtle film grain for cinematic texture."""
+    if strength < 0.5: return frame
+    grain = np.random.normal(0, strength, frame.shape).astype(np.float32)
+    return np.clip(frame.astype(np.float32) + grain, 0, 255).astype(np.uint8)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -664,8 +597,7 @@ class EnergyRenderer:
         self._buf = np.zeros((h, w, 3), dtype=np.float32)
         self._depth_mode = True   # pseudo-3D
 
-    def draw(self, frame, pool, cx, cy, sphere_r,
-             fade=1.0, bloom_boost=0.0, depth_mode=True):
+    def draw(self, frame, pool, cx, cy, sphere_r, fade=1.0):
         if not pool.alive: return
 
         h, w = frame.shape[:2]
@@ -675,28 +607,14 @@ class EnergyRenderer:
         r_eff = sphere_r * max(scale, 0.01)
 
         N = N_TENDRILS
-        pts  = pool.pts          # (N, TENDRIL_PTS, 2)
+        pts    = pool.pts
         bright = pool._brightness * fade
         cols   = ENERGY_COLORS[pool._color_idx]  # (N, 3) BGR float
 
-        # Z-depth: back tendrils are dimmer, slightly desaturated (pseudo-3D)
-        if depth_mode:
-            z      = pool._z_depth  # (N,) in [-1, 1]
-            z_fade = (z + 1.0) / 2.0  # remap to [0,1], 0=back 1=front
-            z_scale= 0.45 + 0.55 * z_fade  # back=0.45 brightness, front=1.0
-            bright = bright * z_scale
-            # Back tendrils shifted blue (depth color cue)
-            cols_draw = cols.copy()
-            cols_draw[:,0] = cols[:,0] * (0.6 + 0.4*z_fade)  # B channel
-            cols_draw[:,2] = cols[:,2] * (0.4 + 0.6*z_fade)  # R channel
-        else:
-            cols_draw = cols
-            z_fade = np.ones(N, dtype=np.float32)
-
-        # Draw each tendril (OpenCV line calls — loop necessary but outer loop only)
+        # Draw each tendril
         for i in range(N):
             br  = float(bright[i])
-            col = cols_draw[i]
+            col = cols[i]
             th  = int(pool._thickness[i])
 
             for j in range(TENDRIL_PTS-1):
@@ -713,22 +631,20 @@ class EnergyRenderer:
             if 0<=rp[0]<w and 0<=rp[1]<h:
                 buf[rp[1],rp[0]] = np.minimum(
                     500.0,
-                    buf[rp[1],rp[0]] + np.array([255.,255.,255.], np.float32)*float(z_fade[i]))
+                    buf[rp[1],rp[0]] + np.array([255.,255.,255.], np.float32))
 
         # ── 4-pass bloom ──────────────────────────────────────────────────
         results = []
         for ds, wt, sig_mul in [(8,1.80,0.22),(4,1.20,0.10),(2,0.70,0.05),(1,0.40,0.02)]:
             bw=max(1,w//ds); bh=max(1,h//ds)
             s   = cv2.resize(buf, (bw,bh), interpolation=cv2.INTER_LINEAR)
-            sig = max(1.0, r_eff*sig_mul + bloom_boost*0.06)
+            sig = max(1.0, r_eff*sig_mul)
             bl  = cv2.GaussianBlur(s,(0,0),sigmaX=sig)
             results.append((cv2.resize(bl,(w,h),interpolation=cv2.INTER_LINEAR), wt))
 
         combined = buf * 1.2
         for layer, wt in results:
             combined += layer * wt
-        if bloom_boost > 0:
-            combined += results[0][0] * (bloom_boost * 0.016)
         np.clip(combined, 0, 255, out=combined)
         cv2.add(frame, combined.astype(np.uint8), dst=frame)
 
@@ -832,9 +748,7 @@ class ShatterSystem:
         self.hx=self.hy=0.0
         self.cube_s = float(CUBE_HALF)
         self.ex=self.ey=0.0
-        self._bloom_t0=-999.0
         self.t_anim=0.0
-
         self.pool        = EnergyParticlePool(seed=seed)
         self.cracks      = CrackEffect()
         self.arcs        = ElectricArcSystem(seed=seed+10)
@@ -847,7 +761,7 @@ class ShatterSystem:
         self.shockwaves.spawn(self.hx,self.hy,now,color=(100,220,255))
 
     def _begin_explosion(self, now, t):
-        self.state=EXPLODING; self.t0=now; self._bloom_t0=now
+        self.state=EXPLODING; self.t0=now
         self.pool.explode(t)
         self.shockwaves.spawn(self.hx,self.hy,now,color=(200,240,255))
 
@@ -908,15 +822,8 @@ class ShatterSystem:
                 self.state=INTACT
 
     def draw(self, frame, now, renderer, dt,
-             enable_shake=True, enable_bloom=True,
-             cam_shake=None, depth_mode=True):
+             enable_shake=True, cam_shake=None):
         t=self.t_anim
-        bloom_boost=0.0
-        if enable_bloom:
-            bd=now-self._bloom_t0
-            if bd<BLOOM_DECAY_SECS:
-                bloom_boost=BLOOM_PEAK_SIGMA*(1.0-bd/BLOOM_DECAY_SECS)
-
         sphere_r=self.cube_s*SPHERE_RADIUS_MUL
 
         self.shockwaves.draw(frame, now)
@@ -927,27 +834,22 @@ class ShatterSystem:
             self.cracks.draw(frame,prog)
 
         elif self.state in (EXPLODING,FLOATING):
-            renderer.draw(frame,self.pool,self.ex,self.ey,
-                          sphere_r,fade=1.0,bloom_boost=bloom_boost,
-                          depth_mode=depth_mode)
+            renderer.draw(frame,self.pool,self.ex,self.ey,sphere_r,fade=1.0)
             self.arcs.draw(frame, now)
 
         elif self.state==ORBIT:
-            renderer.draw(frame,self.pool,self.ex,self.ey,
-                          sphere_r,fade=1.0,depth_mode=depth_mode)
+            renderer.draw(frame,self.pool,self.ex,self.ey,sphere_r,fade=1.0)
 
         elif self.state==CONVERGE:
             fade=max(0.0,1.0-(now-self.t0)/CONVERGE_SECS*0.7)
             renderer.draw(frame,self.pool,self.ex,self.ey,
-                          sphere_r*(1.0-self.pool.collapse),
-                          fade=fade,depth_mode=depth_mode)
+                          sphere_r*(1.0-self.pool.collapse),fade=fade)
 
         elif self.state==BUILDING:
             prog=min((now-self.t0)/LAYER_BUILD_SECS,1.0)
             fade=max(0.0,1.0-prog)
             if fade>0.01:
-                renderer.draw(frame,self.pool,self.ex,self.ey,
-                              sphere_r,fade=fade,depth_mode=depth_mode)
+                renderer.draw(frame,self.pool,self.ex,self.ey,sphere_r,fade=fade)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1029,22 +931,18 @@ class FPSCounter:
 # HUD
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def draw_hud(frame, fps, debug, hand_data, shake_on, bloom_on,
-             chroma_on, vignette_on, depth_on):
+def draw_hud(frame, fps, debug, hand_data, shake_on, chroma_on):
     h,w=frame.shape[:2]
     bar=np.zeros((36,w,3),dtype=np.uint8)
     cv2.addWeighted(bar,0.40,frame[:36],0.60,0,frame[:36])
     fps_col=(100,255,100) if fps>=45 else (0,165,255) if fps>=25 else (0,60,255)
     cv2.putText(frame,f"FPS {fps:.0f}",(10,24),
                 cv2.FONT_HERSHEY_SIMPLEX,0.65,fps_col,1,cv2.LINE_AA)
-    hints=(f"q=quit r=reset d=debug s=shake b=bloom c=chroma v=vig z=depth  "
-           f"shk={'ON' if shake_on else'OFF'} "
-           f"blm={'ON' if bloom_on else'OFF'} "
-           f"chr={'ON' if chroma_on else'OFF'} "
-           f"vig={'ON' if vignette_on else'OFF'} "
-           f"3D={'ON' if depth_on else'OFF'}")
+    hints=(f"q=quit  r=reset  d=debug  s=shake  c=chroma  "
+           f"shk={'ON' if shake_on else 'OFF'}  "
+           f"chr={'ON' if chroma_on else 'OFF'}")
     cv2.putText(frame,hints,(6,24),
-                cv2.FONT_HERSHEY_SIMPLEX,0.37,(160,160,160),1,cv2.LINE_AA)
+                cv2.FONT_HERSHEY_SIMPLEX,0.42,(160,160,160),1,cv2.LINE_AA)
     if not debug or not hand_data: return
     for idx,hd in enumerate(hand_data):
         y=60+idx*28
@@ -1092,23 +990,19 @@ def main():
     sparkles   = AmbientSparkles()
     charge_fx  = ChargeEffect()
     renderer   = EnergyRenderer(CAMERA_WIDTH, CAMERA_HEIGHT)
-    post       = CinematicPost(CAMERA_WIDTH, CAMERA_HEIGHT)
     cam_shake  = CameraShake()
     fps_ctr    = FPSCounter()
 
     t0=time.time(); prev_time=t0
     debug_mode  = False
     shake_on    = True
-    bloom_on    = True
     chroma_on   = True
-    vignette_on = True
-    depth_on    = True
 
     skeleton_layer=np.zeros((CAMERA_HEIGHT,CAMERA_WIDTH,3),dtype=np.uint8)
     sparkle_layer =np.zeros((CAMERA_HEIGHT,CAMERA_WIDTH,3),dtype=np.uint8)
 
     print("Hand Shatter v5 — Cinematic Plasma")
-    print("  q=quit  r=reset  d=debug  s=shake  b=bloom  c=chroma  v=vignette  z=depth")
+    print("  q=quit  r=reset  d=debug  s=shake  c=chroma")
     print("  Open hand → plasma orb  |  Close fist → absorb")
     if NUMBA: print("  [Numba JIT active]")
 
@@ -1177,8 +1071,8 @@ def main():
                         charge_fx.draw(frame,hx,hy,cube_s*1.4,t,ci)
 
                     sys_.draw(frame,now,renderer,dt,
-                              enable_shake=shake_on,enable_bloom=bloom_on,
-                              cam_shake=cam_shake,depth_mode=depth_on)
+                              enable_shake=shake_on,
+                              cam_shake=cam_shake)
 
                     hand_data_hud.append({
                         "gesture":    gesture,
@@ -1199,33 +1093,22 @@ def main():
             if any_sparkle:
                 cv2.add(frame,sparkle_layer,dst=frame)
 
-            # ── Cinematic post-processing pipeline ────────────────────────
-            if vignette_on:
-                frame=post.apply_vignette(frame)
-
-            if bloom_on:
-                # Aggregate bloom_boost from all active systems
-                boost=max((BLOOM_PEAK_SIGMA*(1.0-(now-s._bloom_t0)/BLOOM_DECAY_SECS)
-                           for s in systems.values()
-                           if now-s._bloom_t0 < BLOOM_DECAY_SECS), default=0.0)
-                frame=post.apply_bloom(frame, intensity=1.0, bloom_boost=boost)
-
+            # ── Post-processing ───────────────────────────────────────────
             if chroma_on:
-                # Chromatic aberration stronger during explosion
                 chroma_str = 2.0
                 for s in systems.values():
                     if s.state in (EXPLODING,FLOATING):
                         chroma_str = 4.0; break
-                frame=post.apply_chromatic_aberration(frame, strength=chroma_str)
+                frame=apply_chromatic_aberration(frame, strength=chroma_str)
 
-            frame=post.apply_film_grain(frame, strength=3.5)
+            frame=apply_film_grain(frame, strength=3.5)
 
             if shake_on:
                 frame=cam_shake.apply(frame,now)
 
             fps_ctr.tick()
             draw_hud(frame,fps_ctr.fps,debug_mode,hand_data_hud,
-                     shake_on,bloom_on,chroma_on,vignette_on,depth_on)
+                     shake_on,chroma_on)
 
             cv2.imshow("Hand Shatter v5 — Cinematic Plasma  [q=quit]",frame)
 
@@ -1237,14 +1120,8 @@ def main():
                 debug_mode=not debug_mode; print(f"[INFO] Debug {'ON' if debug_mode else 'OFF'}.")
             elif key==ord('s'):
                 shake_on=not shake_on; print(f"[INFO] Shake {'ON' if shake_on else 'OFF'}.")
-            elif key==ord('b'):
-                bloom_on=not bloom_on; print(f"[INFO] Bloom {'ON' if bloom_on else 'OFF'}.")
             elif key==ord('c'):
                 chroma_on=not chroma_on; print(f"[INFO] Chroma {'ON' if chroma_on else 'OFF'}.")
-            elif key==ord('v'):
-                vignette_on=not vignette_on; print(f"[INFO] Vignette {'ON' if vignette_on else 'OFF'}.")
-            elif key==ord('z'):
-                depth_on=not depth_on; print(f"[INFO] Depth 3D {'ON' if depth_on else 'OFF'}.")
 
     cap.release()
     cv2.destroyAllWindows()
